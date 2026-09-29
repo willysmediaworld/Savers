@@ -414,6 +414,37 @@ def member_detail_update_delete(member_id):
             'recent_savings': savings
         })
 
+@app.route('/api/member/<member_id>/reset-ledger', methods=['POST'])
+def reset_single_member_ledger(member_id):
+    db = get_db()
+    cursor = db.cursor()
+    p = query_param()
+
+    cursor.execute(f'SELECT id, full_name, member_id FROM members WHERE member_id = {p}', (member_id,))
+    m = cursor.fetchone()
+    if not m:
+        return jsonify({'success': False, 'message': 'Member not found.'}), 404
+
+    actual_id = m['member_id']
+
+    # Delete loan repayments associated with member's loans
+    cursor.execute(f'''
+        DELETE FROM loan_repayments 
+        WHERE loan_id IN (SELECT id FROM loans WHERE member_id = {p})
+    ''', (actual_id,))
+
+    # Delete all transactions for this specific member
+    cursor.execute(f'DELETE FROM savings WHERE member_id = {p}', (actual_id,))
+    cursor.execute(f'DELETE FROM service_fees WHERE member_id = {p}', (actual_id,))
+    cursor.execute(f'DELETE FROM withdrawals WHERE member_id = {p}', (actual_id,))
+    cursor.execute(f'DELETE FROM loans WHERE member_id = {p}', (actual_id,))
+
+    # Reset member cycle counters back to Cycle 1, 0 Days
+    cursor.execute(f'UPDATE members SET current_cycle = 1, cycle_days = 0 WHERE member_id = {p}', (actual_id,))
+
+    db.commit()
+    return jsonify({'success': True, 'message': f'Financial data for {m["full_name"]} ({actual_id}) reset successfully!'})
+
 # -----------------------------------------------------------------------------
 # SAVINGS LOGIC
 # -----------------------------------------------------------------------------
@@ -1576,7 +1607,7 @@ INDEX_TEMPLATE = """
             <div class="modal-nav-tabs">
                 <div class="modal-tab active" onclick="switchModalTab('overview')">Overview</div>
                 <div class="modal-tab" onclick="switchModalTab('save')">➕ Save</div>
-                <div class="modal-tab" onclick="switchModalTab('withdraw')">🏧 Withdraw</div>
+                <div class="modal-tab" onclick="switchModalTab('withdraw')">抓 Withdraw</div>
                 <div class="modal-tab" onclick="switchModalTab('loans')">💳 Issue Loan</div>
                 <div class="modal-tab" onclick="switchModalTab('manage')">⚙️ Edit / Credentials</div>
             </div>
@@ -1683,6 +1714,19 @@ INDEX_TEMPLATE = """
                         </div>
                         <button type="submit" class="btn-submit">Save Changes & Credentials</button>
                     </form>
+                </div>
+
+                <!-- RESET MEMBER FINANCIAL DATA SUBCARD -->
+                <div class="manage-subcard" style="border-color:#fde68a; background:#fffbeb;">
+                    <div class="manage-subcard-title" style="color:var(--amber-fee);">
+                        <i class="fa-solid fa-rotate-left"></i> 🧹 Reset Member Financial Data
+                    </div>
+                    <p style="font-size:0.8rem; color:var(--text-muted); margin-bottom:0.75rem;">
+                        Clears all savings, withdrawals, loans, and fee logs for this member. Resets cycle back to Cycle 1 (0 days). Member profile and login credentials are preserved.
+                    </p>
+                    <button class="btn-submit" style="background:var(--amber-fee);" onclick="triggerResetMemberLedger()">
+                        Reset Member Financial Data
+                    </button>
                 </div>
 
                 <div class="manage-subcard" style="border-color:#fca5a5; background:#fff5f5;">
@@ -2112,6 +2156,25 @@ INDEX_TEMPLATE = """
                     showToast(result.message);
                     await fetchAndRenderMembers();
                     renderManageMembersTable();
+                } else {
+                    showToast(result.message, 'error');
+                }
+            }
+        }
+
+        async function triggerResetMemberLedger() {
+            if (!currentModalMember) return;
+            const confirmed = await showCustomConfirm(
+                "Reset Member Financial Data", 
+                `Are you sure you want to clear all savings, withdrawals, loans, and fee logs for ${currentModalMember.full_name} (${currentModalMember.member_id})? Profile and login credentials will remain intact.`
+            );
+            if (confirmed) {
+                const res = await fetch(`/api/member/${currentModalMember.member_id}/reset-ledger`, { method: 'POST' });
+                const result = await res.json();
+                if (result.success) {
+                    showToast(result.message);
+                    await fetchAndRenderMembers();
+                    openMemberModal(currentModalMember.member_id);
                 } else {
                     showToast(result.message, 'error');
                 }
