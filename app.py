@@ -4,21 +4,27 @@ from datetime import datetime, date
 from flask import Flask, render_template_string, request, jsonify, g
 from werkzeug.security import generate_password_hash, check_password_hash
 
-# -----------------------------------------------------------------------------
-# APPLICATION CONFIGURATION
-# -----------------------------------------------------------------------------
-DATABASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'savers_growth.db')
+# Handle PostgreSQL on Render or SQLite locally
+DATABASE_URL = os.environ.get('DATABASE_URL')
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'savers_growth_31day_cycle_key_2026')
 
 # -----------------------------------------------------------------------------
-# DATABASE SETUP & MIGRATIONS
+# DATABASE SETUP
 # -----------------------------------------------------------------------------
 def get_db():
     if 'db' not in g:
-        g.db = sqlite3.connect(DATABASE)
-        g.db.row_factory = sqlite3.Row
+        if DATABASE_URL:
+            import psycopg2
+            import psycopg2.extras
+            # Convert postgres:// to postgresql:// for SQLAlchemy/psycopg2 compatibility
+            url = DATABASE_URL.replace("postgres://", "postgresql://")
+            g.db = psycopg2.connect(url, cursor_factory=psycopg2.extras.DictCursor)
+        else:
+            db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'savers_growth.db')
+            g.db = sqlite3.connect(db_path)
+            g.db.row_factory = sqlite3.Row
     return g.db
 
 @app.teardown_appcontext
@@ -32,10 +38,12 @@ def init_db():
         db = get_db()
         cursor = db.cursor()
 
-        # Members Table
-        cursor.execute('''
+        is_postgres = bool(DATABASE_URL)
+        pk_type = "SERIAL PRIMARY KEY" if is_postgres else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+        cursor.execute(f'''
             CREATE TABLE IF NOT EXISTS members (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {pk_type},
                 member_id TEXT UNIQUE NOT NULL,
                 full_name TEXT NOT NULL,
                 phone TEXT DEFAULT '',
@@ -50,10 +58,9 @@ def init_db():
             )
         ''')
 
-        # Savings Table
-        cursor.execute('''
+        cursor.execute(f'''
             CREATE TABLE IF NOT EXISTS savings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {pk_type},
                 member_id TEXT NOT NULL,
                 amount REAL NOT NULL,
                 date TEXT NOT NULL,
@@ -61,30 +68,26 @@ def init_db():
                 is_service_fee INTEGER DEFAULT 0,
                 days_credited INTEGER DEFAULT 0,
                 notes TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (member_id) REFERENCES members(member_id)
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
 
-        # Withdrawals Table
-        cursor.execute('''
+        cursor.execute(f'''
             CREATE TABLE IF NOT EXISTS withdrawals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {pk_type},
                 member_id TEXT NOT NULL,
                 amount REAL NOT NULL,
                 withdrawal_type TEXT NOT NULL,
                 fee_deducted REAL DEFAULT 0,
                 date TEXT NOT NULL,
                 notes TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (member_id) REFERENCES members(member_id)
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
 
-        # Loans Table (Interest rate set to 0 by default)
-        cursor.execute('''
+        cursor.execute(f'''
             CREATE TABLE IF NOT EXISTS loans (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {pk_type},
                 member_id TEXT NOT NULL,
                 amount REAL NOT NULL,
                 interest_rate REAL DEFAULT 0.0,
@@ -92,42 +95,36 @@ def init_db():
                 amount_paid REAL DEFAULT 0,
                 status TEXT DEFAULT 'active',
                 issue_date TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (member_id) REFERENCES members(member_id)
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
 
-        # Loan Repayments Table
-        cursor.execute('''
+        cursor.execute(f'''
             CREATE TABLE IF NOT EXISTS loan_repayments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {pk_type},
                 loan_id INTEGER NOT NULL,
                 amount REAL NOT NULL,
                 date TEXT NOT NULL,
                 notes TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (loan_id) REFERENCES loans(id)
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
 
-        # Service Fees Table
-        cursor.execute('''
+        cursor.execute(f'''
             CREATE TABLE IF NOT EXISTS service_fees (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {pk_type},
                 member_id TEXT NOT NULL,
                 amount REAL NOT NULL,
                 month_year TEXT NOT NULL,
                 description TEXT,
                 date TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (member_id) REFERENCES members(member_id)
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
 
-        # Admin Users Table
-        cursor.execute('''
+        cursor.execute(f'''
             CREATE TABLE IF NOT EXISTS admin_users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {pk_type},
                 username TEXT UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -138,28 +135,26 @@ def init_db():
 
         # Seed initial admin account
         cursor.execute('SELECT COUNT(*) FROM admin_users')
-        if cursor.fetchone()[0] == 0:
+        row = cursor.fetchone()
+        count = row[0] if row else 0
+        if count == 0:
             default_hash = generate_password_hash('admin123')
-            cursor.execute('INSERT INTO admin_users (username, password_hash) VALUES (?, ?)', ('admin', default_hash))
+            if is_postgres:
+                cursor.execute('INSERT INTO admin_users (username, password_hash) VALUES (%s, %s)', ('admin', default_hash))
+            else:
+                cursor.execute('INSERT INTO admin_users (username, password_hash) VALUES (?, ?)', ('admin', default_hash))
             db.commit()
 
-        # Seed only SVR0001 (Oladele Rotimi Williams) - All other dummy members removed
-        cursor.execute('SELECT id FROM members WHERE member_id = "SVR0001"')
-        admin_member = cursor.fetchone()
-        if not admin_member:
-            cursor.execute('''
-                INSERT INTO members (member_id, full_name, phone, email, username, daily_target, current_cycle, cycle_days, status)
-                VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?)
-            ''', ('SVR0001', 'Oladele Rotimi Williams', '09018363715', 'oladele@saversgrowth.com', 'Exploratives', 1000.0, 'Owner/Admin'))
-            db.commit()
-
-# Initialize Database
+# Initialize Database ONCE
 with app.app_context():
     init_db()
 
 # -----------------------------------------------------------------------------
 # REST API ENDPOINTS
 # -----------------------------------------------------------------------------
+
+def query_param():
+    return "%s" if DATABASE_URL else "?"
 
 @app.route('/api/stats/overview', methods=['GET'])
 def get_wallet_overview():
@@ -188,6 +183,7 @@ def get_wallet_overview():
 def manage_members():
     db = get_db()
     cursor = db.cursor()
+    p = query_param()
 
     if request.method == 'POST':
         data = request.json or {}
@@ -207,16 +203,16 @@ def manage_members():
         member_id = f"SVR{count:04d}"
 
         while True:
-            cursor.execute('SELECT id FROM members WHERE member_id = ?', (member_id,))
+            cursor.execute(f'SELECT id FROM members WHERE member_id = {p}', (member_id,))
             if not cursor.fetchone():
                 break
             count += 1
             member_id = f"SVR{count:04d}"
 
         try:
-            cursor.execute('''
+            cursor.execute(f'''
                 INSERT INTO members (member_id, full_name, phone, email, username, daily_target, current_cycle, cycle_days, status)
-                VALUES (?, ?, '', '', ?, ?, 1, 0, 'active')
+                VALUES ({p}, {p}, '', '', {p}, {p}, 1, 0, 'active')
             ''', (member_id, full_name, full_name.split()[0], daily_target))
             db.commit()
             return jsonify({'success': True, 'message': f'Member registered! ID: {member_id}', 'member_id': member_id})
@@ -229,7 +225,7 @@ def manage_members():
                    m.current_cycle, m.cycle_days, m.status, m.created_at,
                    COALESCE((SELECT SUM(amount) FROM savings WHERE member_id = m.member_id AND is_service_fee = 0), 0) as total_saved,
                    COALESCE((SELECT SUM(amount) FROM withdrawals WHERE member_id = m.member_id), 0) as total_withdrawn,
-                   COALESCE((SELECT SUM(repayment_amount - amount_paid) FROM loans WHERE member_id = m.member_id AND status = "active"), 0) as active_loan
+                   COALESCE((SELECT SUM(repayment_amount - amount_paid) FROM loans WHERE member_id = m.member_id AND status = 'active'), 0) as active_loan
             FROM members m
             ORDER BY m.id ASC
         ''')
@@ -251,7 +247,7 @@ def manage_members():
                 'total_withdrawn': r['total_withdrawn'],
                 'net_balance': r['total_saved'] - r['total_withdrawn'],
                 'active_loan': r['active_loan'],
-                'created_at': r['created_at']
+                'created_at': str(r['created_at'])
             })
         return jsonify(members)
 
@@ -259,20 +255,21 @@ def manage_members():
 def member_detail_update_delete(member_id):
     db = get_db()
     cursor = db.cursor()
+    p = query_param()
 
     if request.method == 'DELETE':
-        cursor.execute('SELECT member_id, full_name FROM members WHERE member_id = ? OR id = ?', (member_id, member_id))
+        cursor.execute(f'SELECT member_id, full_name FROM members WHERE member_id = {p}', (member_id,))
         m = cursor.fetchone()
         if not m:
             return jsonify({'success': False, 'message': 'Member not found.'}), 404
 
         actual_id = m['member_id']
 
-        cursor.execute('DELETE FROM savings WHERE member_id = ?', (actual_id,))
-        cursor.execute('DELETE FROM withdrawals WHERE member_id = ?', (actual_id,))
-        cursor.execute('DELETE FROM loans WHERE member_id = ?', (actual_id,))
-        cursor.execute('DELETE FROM service_fees WHERE member_id = ?', (actual_id,))
-        cursor.execute('DELETE FROM members WHERE member_id = ?', (actual_id,))
+        cursor.execute(f'DELETE FROM savings WHERE member_id = {p}', (actual_id,))
+        cursor.execute(f'DELETE FROM withdrawals WHERE member_id = {p}', (actual_id,))
+        cursor.execute(f'DELETE FROM loans WHERE member_id = {p}', (actual_id,))
+        cursor.execute(f'DELETE FROM service_fees WHERE member_id = {p}', (actual_id,))
+        cursor.execute(f'DELETE FROM members WHERE member_id = {p}', (actual_id,))
         db.commit()
 
         return jsonify({'success': True, 'message': f'Member {m["full_name"]} ({actual_id}) deleted successfully!'})
@@ -280,30 +277,28 @@ def member_detail_update_delete(member_id):
     elif request.method == 'PUT':
         data = request.json or {}
         full_name = data.get('full_name', '').strip()
-        phone = data.get('phone', '').strip()
-        username = data.get('username', '').strip()
         raw_target = data.get('daily_target')
         try:
             daily_target = float(raw_target) if raw_target not in (None, '') else 500.0
         except (ValueError, TypeError):
             daily_target = 500.0
 
-        cursor.execute('''
+        cursor.execute(f'''
             UPDATE members 
-            SET full_name = ?, phone = ?, username = ?, daily_target = ?
-            WHERE member_id = ? OR id = ?
-        ''', (full_name, phone, username, daily_target, member_id, member_id))
+            SET full_name = {p}, daily_target = {p}
+            WHERE member_id = {p}
+        ''', (full_name, daily_target, member_id))
         db.commit()
-        return jsonify({'success': True, 'message': 'Member profile & daily target updated!'})
+        return jsonify({'success': True, 'message': 'Member profile updated!'})
 
     else:
-        cursor.execute('''
+        cursor.execute(f'''
             SELECT m.*,
                    COALESCE((SELECT SUM(amount) FROM savings WHERE member_id = m.member_id AND is_service_fee = 0), 0) as total_saved,
                    COALESCE((SELECT SUM(amount) FROM withdrawals WHERE member_id = m.member_id), 0) as total_withdrawn,
-                   COALESCE((SELECT SUM(repayment_amount - amount_paid) FROM loans WHERE member_id = m.member_id AND status = "active"), 0) as active_loan
-            FROM members m WHERE m.member_id = ? OR m.id = ?
-        ''', (member_id, member_id))
+                   COALESCE((SELECT SUM(repayment_amount - amount_paid) FROM loans WHERE member_id = m.member_id AND status = 'active'), 0) as active_loan
+            FROM members m WHERE m.member_id = {p}
+        ''', (member_id,))
         m = cursor.fetchone()
 
         if not m:
@@ -311,10 +306,10 @@ def member_detail_update_delete(member_id):
 
         member_id_actual = m['member_id']
 
-        cursor.execute('''
+        cursor.execute(f'''
             SELECT id, amount, date, notes, is_service_fee, days_credited 
             FROM savings 
-            WHERE member_id = ? 
+            WHERE member_id = {p} 
             ORDER BY id DESC LIMIT 10
         ''', (member_id_actual,))
         savings = [dict(s) for s in cursor.fetchall()]
@@ -325,8 +320,6 @@ def member_detail_update_delete(member_id):
                 'id': m['id'],
                 'member_id': m['member_id'],
                 'full_name': m['full_name'],
-                'phone': m['phone'] or '',
-                'username': m['username'] or m['full_name'].split()[0],
                 'daily_target': m['daily_target'],
                 'current_cycle': m['current_cycle'],
                 'cycle_days': m['cycle_days'],
@@ -338,43 +331,6 @@ def member_detail_update_delete(member_id):
             'recent_savings': savings
         })
 
-@app.route('/api/member/<member_id>/password', methods=['POST'])
-def reset_member_password(member_id):
-    db = get_db()
-    cursor = db.cursor()
-    data = request.json or {}
-    new_password = data.get('password', '').strip()
-
-    if not new_password:
-        return jsonify({'success': False, 'message': 'Please enter a valid password.'}), 400
-
-    pwd_hash = generate_password_hash(new_password)
-    cursor.execute('UPDATE members SET password_hash = ? WHERE member_id = ? OR id = ?', (pwd_hash, member_id, member_id))
-    db.commit()
-    return jsonify({'success': True, 'message': 'Member password reset successfully!'})
-
-@app.route('/api/member/<member_id>/reset-ledger', methods=['POST'])
-def reset_member_ledger(member_id):
-    db = get_db()
-    cursor = db.cursor()
-
-    cursor.execute('SELECT member_id FROM members WHERE member_id = ? OR id = ?', (member_id, member_id))
-    m = cursor.fetchone()
-    if not m:
-        return jsonify({'success': False, 'message': 'Member not found.'}), 404
-
-    actual_id = m['member_id']
-
-    cursor.execute('DELETE FROM savings WHERE member_id = ?', (actual_id,))
-    cursor.execute('DELETE FROM withdrawals WHERE member_id = ?', (actual_id,))
-    cursor.execute('DELETE FROM loans WHERE member_id = ?', (actual_id,))
-    cursor.execute('DELETE FROM service_fees WHERE member_id = ?', (actual_id,))
-
-    cursor.execute('UPDATE members SET current_cycle = 1, cycle_days = 0 WHERE member_id = ?', (actual_id,))
-    db.commit()
-
-    return jsonify({'success': True, 'message': 'Member financial ledger reset!'})
-
 # -----------------------------------------------------------------------------
 # SAVINGS LOGIC
 # -----------------------------------------------------------------------------
@@ -382,6 +338,7 @@ def reset_member_ledger(member_id):
 def handle_savings():
     db = get_db()
     cursor = db.cursor()
+    p = query_param()
 
     if request.method == 'POST':
         data = request.json or {}
@@ -397,7 +354,7 @@ def handle_savings():
         if not member_id or deposit_amount <= 0:
             return jsonify({'success': False, 'message': 'Select member and enter a valid amount.'}), 400
 
-        cursor.execute('SELECT full_name, current_cycle, cycle_days, daily_target FROM members WHERE member_id = ?', (member_id,))
+        cursor.execute(f'SELECT full_name, current_cycle, cycle_days, daily_target FROM members WHERE member_id = {p}', (member_id,))
         m = cursor.fetchone()
         if not m:
             return jsonify({'success': False, 'message': 'Member not found.'}), 404
@@ -419,14 +376,14 @@ def handle_savings():
                 remaining_cash -= fee_deducted
                 total_fees_collected += fee_deducted
 
-                cursor.execute('''
+                cursor.execute(f'''
                     INSERT INTO savings (member_id, amount, date, month_year, is_service_fee, days_credited, notes)
-                    VALUES (?, ?, ?, ?, 1, 0, ?)
+                    VALUES ({p}, {p}, {p}, {p}, 1, 0, {p})
                 ''', (member_id, fee_deducted, savings_date, month_year, f'Cycle {current_cycle} Service Fee'))
 
-                cursor.execute('''
+                cursor.execute(f'''
                     INSERT INTO service_fees (member_id, amount, month_year, description, date)
-                    VALUES (?, ?, ?, ?, ?)
+                    VALUES ({p}, {p}, {p}, {p}, {p})
                 ''', (member_id, fee_deducted, month_year, f'Cycle {current_cycle} First Save Fee', savings_date))
 
                 if remaining_cash <= 0:
@@ -445,9 +402,9 @@ def handle_savings():
                 total_days_added += days_bought
                 cycle_days += days_bought
 
-                cursor.execute('''
+                cursor.execute(f'''
                     INSERT INTO savings (member_id, amount, date, month_year, is_service_fee, days_credited, notes)
-                    VALUES (?, ?, ?, ?, 0, ?, ?)
+                    VALUES ({p}, {p}, {p}, {p}, 0, {p}, {p})
                 ''', (member_id, cash_spent, savings_date, month_year, days_bought, notes or f'Contribution ({days_bought} days)'))
 
             if cycle_days >= 31:
@@ -456,7 +413,7 @@ def handle_savings():
             else:
                 break
 
-        cursor.execute('UPDATE members SET current_cycle = ?, cycle_days = ? WHERE member_id = ?', 
+        cursor.execute(f'UPDATE members SET current_cycle = {p}, cycle_days = {p} WHERE member_id = {p}', 
                        (current_cycle, cycle_days, member_id))
         db.commit()
 
@@ -480,8 +437,9 @@ def handle_savings():
 def delete_savings(savings_id):
     db = get_db()
     cursor = db.cursor()
+    p = query_param()
 
-    cursor.execute('SELECT member_id, amount, is_service_fee, days_credited FROM savings WHERE id = ?', (savings_id,))
+    cursor.execute(f'SELECT member_id, amount, is_service_fee, days_credited FROM savings WHERE id = {p}', (savings_id,))
     row = cursor.fetchone()
     if not row:
         return jsonify({'success': False, 'message': 'Entry not found.'}), 404
@@ -490,17 +448,17 @@ def delete_savings(savings_id):
     is_fee = row['is_service_fee']
     days_credited = row['days_credited']
 
-    cursor.execute('DELETE FROM savings WHERE id = ?', (savings_id,))
+    cursor.execute(f'DELETE FROM savings WHERE id = {p}', (savings_id,))
 
     if is_fee:
-        cursor.execute('DELETE FROM service_fees WHERE member_id = ? AND amount = ? ORDER BY id DESC LIMIT 1', (member_id, row['amount']))
-        cursor.execute('UPDATE members SET cycle_days = 0 WHERE member_id = ?', (member_id,))
+        cursor.execute(f'DELETE FROM service_fees WHERE member_id = {p} AND amount = {p}', (member_id, row['amount']))
+        cursor.execute(f'UPDATE members SET cycle_days = 0 WHERE member_id = {p}', (member_id,))
     else:
-        cursor.execute('SELECT cycle_days FROM members WHERE member_id = ?', (member_id,))
+        cursor.execute(f'SELECT cycle_days FROM members WHERE member_id = {p}', (member_id,))
         m = cursor.fetchone()
         if m:
             new_days = max(0, m['cycle_days'] - days_credited)
-            cursor.execute('UPDATE members SET cycle_days = ? WHERE member_id = ?', (new_days, member_id))
+            cursor.execute(f'UPDATE members SET cycle_days = {p} WHERE member_id = {p}', (new_days, member_id))
 
     db.commit()
     return jsonify({'success': True, 'message': 'Contribution deleted!'})
@@ -512,6 +470,7 @@ def delete_savings(savings_id):
 def process_withdrawal():
     db = get_db()
     cursor = db.cursor()
+    p = query_param()
     data = request.json or {}
 
     member_id = data.get('member_id')
@@ -527,37 +486,38 @@ def process_withdrawal():
     if not member_id or amount <= 0:
         return jsonify({'success': False, 'message': 'Select member and enter withdrawal amount.'}), 400
 
-    cursor.execute('SELECT COALESCE(SUM(amount), 0) FROM savings WHERE member_id = ? AND is_service_fee = 0', (member_id,))
+    cursor.execute(f'SELECT COALESCE(SUM(amount), 0) FROM savings WHERE member_id = {p} AND is_service_fee = 0', (member_id,))
     total_saved = cursor.fetchone()[0]
-    cursor.execute('SELECT COALESCE(SUM(amount), 0) FROM withdrawals WHERE member_id = ?', (member_id,))
+    cursor.execute(f'SELECT COALESCE(SUM(amount), 0) FROM withdrawals WHERE member_id = {p}', (member_id,))
     total_withdrawn = cursor.fetchone()[0]
     current_balance = total_saved - total_withdrawn
 
     if amount > current_balance:
         return jsonify({'success': False, 'message': f'Insufficient balance! Available: ₦{current_balance:,.2f}'}), 400
 
-    cursor.execute('''
+    cursor.execute(f'''
         INSERT INTO withdrawals (member_id, amount, withdrawal_type, fee_deducted, date, notes)
-        VALUES (?, ?, ?, 0.0, ?, ?)
+        VALUES ({p}, {p}, {p}, 0.0, {p}, {p})
     ''', (member_id, amount, withdrawal_type, w_date, notes))
 
     if withdrawal_type == 'reset':
-        cursor.execute('''
+        cursor.execute(f'''
             UPDATE members 
             SET current_cycle = current_cycle + 1, cycle_days = 0 
-            WHERE member_id = ?
+            WHERE member_id = {p}
         ''', (member_id,))
 
     db.commit()
     return jsonify({'success': True, 'message': 'Withdrawal processed successfully!'})
 
 # -----------------------------------------------------------------------------
-# LOANS API (0% INTEREST, UNLIMITED TIMES)
+# LOANS API
 # -----------------------------------------------------------------------------
 @app.route('/api/loans', methods=['GET', 'POST'])
 def handle_loans():
     db = get_db()
     cursor = db.cursor()
+    p = query_param()
 
     if request.method == 'POST':
         data = request.json or {}
@@ -572,13 +532,10 @@ def handle_loans():
         if not member_id or amount <= 0:
             return jsonify({'success': False, 'message': 'Select member and enter loan amount.'}), 400
 
-        # Repayment is exactly the amount (0% Interest)
-        repayment_amount = amount
-
-        cursor.execute('''
+        cursor.execute(f'''
             INSERT INTO loans (member_id, amount, interest_rate, repayment_amount, issue_date)
-            VALUES (?, ?, 0.0, ?, ?)
-        ''', (member_id, amount, repayment_amount, issue_date))
+            VALUES ({p}, {p}, 0.0, {p}, {p})
+        ''', (member_id, amount, amount, issue_date))
 
         db.commit()
         return jsonify({'success': True, 'message': 'Loan issued successfully!'})
@@ -597,6 +554,7 @@ def handle_loans():
 def repay_loan():
     db = get_db()
     cursor = db.cursor()
+    p = query_param()
     data = request.json or {}
 
     loan_id = data.get('loan_id')
@@ -611,7 +569,7 @@ def repay_loan():
     if not loan_id or amount <= 0:
         return jsonify({'success': False, 'message': 'Valid Loan ID and Repayment Amount required.'}), 400
 
-    cursor.execute('SELECT repayment_amount, amount_paid FROM loans WHERE id = ?', (loan_id,))
+    cursor.execute(f'SELECT repayment_amount, amount_paid FROM loans WHERE id = {p}', (loan_id,))
     loan = cursor.fetchone()
     if not loan:
         return jsonify({'success': False, 'message': 'Loan record not found.'}), 404
@@ -619,9 +577,9 @@ def repay_loan():
     new_paid = loan['amount_paid'] + amount
     status = 'cleared' if new_paid >= loan['repayment_amount'] else 'active'
 
-    cursor.execute('INSERT INTO loan_repayments (loan_id, amount, date, notes) VALUES (?, ?, ?, ?)',
+    cursor.execute(f'INSERT INTO loan_repayments (loan_id, amount, date, notes) VALUES ({p}, {p}, {p}, {p})',
                    (loan_id, amount, repay_date, notes))
-    cursor.execute('UPDATE loans SET amount_paid = ?, status = ? WHERE id = ?', (new_paid, status, loan_id))
+    cursor.execute(f'UPDATE loans SET amount_paid = {p}, status = {p} WHERE id = {p}', (new_paid, status, loan_id))
 
     db.commit()
     return jsonify({'success': True, 'message': 'Loan repayment recorded!'})
@@ -689,7 +647,7 @@ def get_service_fees():
     })
 
 # -----------------------------------------------------------------------------
-# MAINTENANCE & CREDENTIALS
+# MAINTENANCE
 # -----------------------------------------------------------------------------
 @app.route('/api/maintenance/resync', methods=['POST'])
 def resync_ledger():
@@ -725,6 +683,7 @@ def reset_all_ledgers():
 def update_password():
     db = get_db()
     cursor = db.cursor()
+    p = query_param()
     data = request.json or {}
 
     old_pass = data.get('old_password', '')
@@ -733,12 +692,12 @@ def update_password():
     if not old_pass or not new_pass:
         return jsonify({'success': False, 'message': 'Both existing and new password required.'}), 400
 
-    cursor.execute('SELECT password_hash FROM admin_users WHERE username = "admin"')
+    cursor.execute("SELECT password_hash FROM admin_users WHERE username = 'admin'")
     row = cursor.fetchone()
 
     if row and check_password_hash(row['password_hash'], old_pass):
         new_hash = generate_password_hash(new_pass)
-        cursor.execute('UPDATE admin_users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE username = "admin"', (new_hash,))
+        cursor.execute(f"UPDATE admin_users SET password_hash = {p} WHERE username = 'admin'", (new_hash,))
         db.commit()
         return jsonify({'success': True, 'message': 'Admin password updated successfully!'})
     else:
@@ -746,7 +705,7 @@ def update_password():
 
 
 # -----------------------------------------------------------------------------
-# FRONTEND TEMPLATE (HTML/CSS/JS)
+# FRONTEND TEMPLATE
 # -----------------------------------------------------------------------------
 INDEX_TEMPLATE = """
 <!DOCTYPE html>
@@ -784,7 +743,6 @@ INDEX_TEMPLATE = """
             display: flex; flex-direction: column; min-height: 100vh;
         }
 
-        /* Toast Notifications */
         #toast-container { position: fixed; top: 20px; right: 20px; z-index: 9999; }
         .toast {
             background: #1e293b; color: #fff; padding: 12px 20px; border-radius: 12px;
@@ -796,7 +754,6 @@ INDEX_TEMPLATE = """
         .toast.error { background: var(--primary-red); }
         @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
 
-        /* Header */
         header {
             background: #ffffff; padding: 1rem 1.25rem;
             display: flex; justify-content: space-between; align-items: center;
@@ -816,7 +773,6 @@ INDEX_TEMPLATE = """
             cursor: pointer; display: flex; align-items: center; gap: 6px;
         }
 
-        /* Global Search Input */
         .search-container { padding: 1rem 1.25rem 0.5rem 1.25rem; max-width: 600px; margin: 0 auto; width: 100%; position: relative; }
         .search-wrapper { position: relative; width: 100%; }
         .search-wrapper i { position: absolute; left: 16px; top: 50%; transform: translateY(-50%); color: #94a3b8; font-size: 1.05rem; }
@@ -835,7 +791,6 @@ INDEX_TEMPLATE = """
         }
         .search-result-item:hover { background: #f1f5f9; }
 
-        /* Main Container */
         .app-container { max-width: 600px; margin: 0 auto; width: 100%; padding: 1rem 1.25rem 2rem 1.25rem; flex: 1; }
 
         .view-section { display: none; }
@@ -849,7 +804,6 @@ INDEX_TEMPLATE = """
             padding: 6px 14px; border-radius: 8px; font-weight: 700; font-size: 0.85rem; cursor: pointer;
         }
 
-        /* Homepage Cards */
         .cards-stack { display: flex; flex-direction: column; gap: 1rem; }
         .menu-card {
             background: var(--card-bg); border: 1.5px solid var(--border-light);
@@ -872,7 +826,6 @@ INDEX_TEMPLATE = """
         .menu-card .card-heading { font-size: 1.15rem; font-weight: 800; color: var(--text-dark); margin-bottom: 2px; }
         .menu-card .card-sub { font-size: 0.85rem; color: var(--text-muted); font-weight: 500; }
 
-        /* Wallet Overview */
         .overview-box {
             background: #f0fdf4; border: 1.5px solid #bbf7d0; border-radius: 16px;
             padding: 1.25rem 1.5rem; margin-bottom: 1.5rem; display: flex; flex-direction: column; gap: 12px;
@@ -895,7 +848,6 @@ INDEX_TEMPLATE = """
             display: flex; align-items: center; justify-content: center; gap: 8px;
         }
 
-        /* Members Directory Cards */
         .filter-row { display: flex; gap: 10px; margin-bottom: 1.25rem; }
         .filter-row input { flex: 1; padding: 12px 16px; border-radius: 12px; border: 1.5px solid var(--border-light); font-size: 0.9rem; background: #fff; }
 
@@ -929,7 +881,6 @@ INDEX_TEMPLATE = """
             display: flex; align-items: center; justify-content: center; gap: 6px;
         }
 
-        /* Generic Modal System */
         .modal-overlay {
             position: fixed; top: 0; left: 0; right: 0; bottom: 0;
             background: rgba(15, 23, 42, 0.6); backdrop-filter: blur(4px);
@@ -947,7 +898,6 @@ INDEX_TEMPLATE = """
         .modal-title { font-size: 1.2rem; font-weight: 800; color: var(--text-dark); }
         .modal-close { background: none; border: none; font-size: 1.6rem; color: var(--text-muted); cursor: pointer; }
 
-        /* Modal Action Tabs */
         .modal-nav-tabs {
             display: flex; gap: 8px; overflow-x: auto; padding-bottom: 8px; margin-bottom: 1.25rem;
             border-bottom: 1px solid var(--border-light);
@@ -972,7 +922,6 @@ INDEX_TEMPLATE = """
         .modal-cycle-box .lbl { font-size: 0.75rem; font-weight: 800; color: var(--purple-cycle); text-transform: uppercase; margin-bottom: 4px; }
         .modal-cycle-box .val { font-weight: 800; color: var(--purple-cycle); font-size: 1rem; }
 
-        /* Card Forms */
         .card-form { background: #fff; border: 1.5px solid var(--border-light); border-radius: 16px; padding: 1.25rem; }
         .form-group { display: flex; flex-direction: column; gap: 6px; margin-bottom: 1rem; }
         .form-group label { font-size: 0.85rem; font-weight: 700; color: var(--text-dark); }
@@ -993,7 +942,6 @@ INDEX_TEMPLATE = """
             font-size: 0.95rem; font-weight: 800; margin-bottom: 0.75rem; display: flex; align-items: center; gap: 8px;
         }
 
-        /* Tables & Badges */
         .table-responsive { overflow-x: auto; border-radius: 12px; border: 1.5px solid var(--border-light); }
         table { width: 100%; border-collapse: collapse; text-align: left; font-size: 0.85rem; }
         th, td { padding: 10px 12px; border-bottom: 1px solid var(--border-light); }
@@ -1022,7 +970,6 @@ INDEX_TEMPLATE = """
             border-radius: 8px; font-size: 0.75rem; font-weight: 700; cursor: pointer;
         }
 
-        /* Footer */
         footer {
             background: #ffffff; color: var(--text-muted); text-align: center;
             padding: 1.25rem; font-size: 0.85rem; font-weight: 600;
@@ -1034,7 +981,6 @@ INDEX_TEMPLATE = """
 
     <div id="toast-container"></div>
 
-    <!-- Header -->
     <header>
         <div class="brand-box" onclick="showSection('home')">
             <div class="sprout-icon"><i class="fa-solid fa-leaf"></i></div>
@@ -1045,7 +991,6 @@ INDEX_TEMPLATE = """
         </button>
     </header>
 
-    <!-- Global Search Input (Searches >= 2 numbers) -->
     <div class="search-container">
         <div class="search-wrapper">
             <i class="fa-solid fa-magnifying-glass"></i>
@@ -1056,10 +1001,8 @@ INDEX_TEMPLATE = """
         <div class="search-results-dropdown" id="search-results-dropdown"></div>
     </div>
 
-    <!-- App Container -->
     <div class="app-container">
 
-        <!-- VIEW 1: HOMEPAGE MENU CARDS -->
         <div id="view-home" class="view-section active">
             <div class="cards-stack">
                 <div class="menu-card" onclick="showSection('overview')">
@@ -1130,7 +1073,6 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 2: WALLET OVERVIEW -->
         <div id="view-overview" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">👛 Wallet Overview</div>
@@ -1163,7 +1105,6 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 3: MEMBERS DIRECTORY -->
         <div id="view-members" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">👥 Members Directory</div>
@@ -1177,7 +1118,6 @@ INDEX_TEMPLATE = """
             <div id="members-cards-container"></div>
         </div>
 
-        <!-- VIEW 4: RECORD SAVINGS -->
         <div id="view-savings" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">➕ Record Savings</div>
@@ -1206,7 +1146,6 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 5: PROCESS WITHDRAWAL (NO PROCESSING FEE) -->
         <div id="view-withdrawal" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">🏧 Process Withdrawal</div>
@@ -1238,7 +1177,6 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 6: LOANS LEDGER (0% INTEREST, UNLIMITED TIMES) -->
         <div id="view-loans" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">💳 Loans Ledger</div>
@@ -1263,7 +1201,6 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 7: DAILY TRACKER -->
         <div id="view-tracker" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">📊 Daily Tracker</div>
@@ -1302,7 +1239,6 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 8: MONTHLY SERVICE FEES -->
         <div id="view-service-fees" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">🏢 Monthly Service Fees</div>
@@ -1332,7 +1268,6 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 9: REGISTER MEMBER (ONLY NAME & DAILY TARGET) -->
         <div id="view-register" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">🆔 Register Member</div>
@@ -1353,7 +1288,6 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 10: MANAGE MEMBERS (EDIT & DELETE PAGE) -->
         <div id="view-manage-members" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">⚙️ Manage Members</div>
@@ -1375,7 +1309,6 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 11: MAINTENANCE -->
         <div id="view-maintenance" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">🛠️ System Maintenance</div>
@@ -1407,7 +1340,6 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 12: PASSWORD -->
         <div id="view-password" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">🔐 Update Password</div>
@@ -1430,7 +1362,6 @@ INDEX_TEMPLATE = """
 
     </div>
 
-    <!-- MEMBER PROFILE MODAL -->
     <div class="modal-overlay" id="member-profile-modal">
         <div class="modal-card">
             <div class="modal-header">
@@ -1446,7 +1377,6 @@ INDEX_TEMPLATE = """
                 <div class="modal-tab" onclick="switchModalTab('manage')">⚙️ Edit / Delete</div>
             </div>
 
-            <!-- TAB 1: OVERVIEW -->
             <div id="modal-panel-overview" class="modal-tab-panel active">
                 <div class="modal-details-list">
                     <div class="modal-detail-item">
@@ -1484,7 +1414,6 @@ INDEX_TEMPLATE = """
                 </div>
             </div>
 
-            <!-- TAB 2: SAVE -->
             <div id="modal-panel-save" class="modal-tab-panel">
                 <form onsubmit="handleModalSave(event)">
                     <div class="form-group">
@@ -1499,7 +1428,6 @@ INDEX_TEMPLATE = """
                 </form>
             </div>
 
-            <!-- TAB 3: WITHDRAW -->
             <div id="modal-panel-withdraw" class="modal-tab-panel">
                 <form onsubmit="handleModalWithdraw(event)">
                     <div class="form-group">
@@ -1517,7 +1445,6 @@ INDEX_TEMPLATE = """
                 </form>
             </div>
 
-            <!-- TAB 4: LOAN (0% INTEREST) -->
             <div id="modal-panel-loans" class="modal-tab-panel">
                 <form onsubmit="handleModalLoan(event)">
                     <div class="form-group">
@@ -1528,7 +1455,6 @@ INDEX_TEMPLATE = """
                 </form>
             </div>
 
-            <!-- TAB 5: MANAGE (EDIT / DELETE MEMBER) -->
             <div id="modal-panel-manage" class="modal-tab-panel">
                 <div class="manage-subcard">
                     <div class="manage-subcard-title" style="color:var(--primary-green-dark);">
@@ -1563,7 +1489,6 @@ INDEX_TEMPLATE = """
         </div>
     </div>
 
-    <!-- CUSTOM CONFIRMATION MODAL -->
     <div class="modal-overlay" id="custom-confirm-modal">
         <div class="modal-card" style="max-width:400px; text-align:center;">
             <div style="font-size:2.5rem; color:var(--amber-fee); margin-bottom:10px;"><i class="fa-solid fa-triangle-exclamation"></i></div>
@@ -1576,7 +1501,6 @@ INDEX_TEMPLATE = """
         </div>
     </div>
 
-    <!-- CUSTOM INPUT PROMPT MODAL (REPAYMENT) -->
     <div class="modal-overlay" id="custom-prompt-modal">
         <div class="modal-card" style="max-width:400px;">
             <div class="modal-title" id="prompt-modal-title" style="margin-bottom:10px;">Repay Loan</div>
@@ -1591,13 +1515,11 @@ INDEX_TEMPLATE = """
         </div>
     </div>
 
-    <!-- Footer -->
     <footer>
         Savers Growth System © 2026<br>
         <span style="font-size: 0.75rem; color: #94a3b8;">Designed by Willys Media World - 09018363715</span>
     </footer>
 
-    <!-- INTERACTIVE JAVASCRIPT LOGIC -->
     <script>
         const todayStr = new Date().toISOString().split('T')[0];
         document.getElementById('savings-date').value = todayStr;
@@ -1609,7 +1531,6 @@ INDEX_TEMPLATE = """
         let confirmResolver = null;
         let promptResolver = null;
 
-        // Custom Confirm Modal
         function showCustomConfirm(title, message, btnText = "Confirm") {
             return new Promise((resolve) => {
                 document.getElementById('confirm-modal-title').innerText = title;
@@ -1625,7 +1546,6 @@ INDEX_TEMPLATE = """
             if (confirmResolver) confirmResolver(val);
         }
 
-        // Custom Prompt Modal
         function showCustomPrompt(title, labelText) {
             return new Promise((resolve) => {
                 document.getElementById('prompt-modal-title').innerText = title;
@@ -1706,7 +1626,7 @@ INDEX_TEMPLATE = """
             );
 
             if (filtered.length === 0) {
-                container.innerHTML = '<div style="text-align:center; padding:2rem; color:var(--text-muted);">No members found.</div>';
+                container.innerHTML = '<div style="text-align:center; padding:2rem; color:var(--text-muted);">No members found. Add your first member!</div>';
                 return;
             }
 
@@ -1823,7 +1743,6 @@ INDEX_TEMPLATE = """
             if (panel) panel.classList.add('active');
         }
 
-        // Global Search Logic for >= 2 numbers
         function handleGlobalSearchInput(e) {
             const query = e.target.value.trim().toLowerCase();
             const dropdown = document.getElementById('search-results-dropdown');
@@ -2276,3 +2195,4 @@ def homepage():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=True)
+    
