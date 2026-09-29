@@ -1,17 +1,17 @@
 import os
 import sqlite3
 from datetime import datetime, date
-from flask import Flask, render_template_string, request, jsonify, g
+from flask import Flask, render_template_string, request, jsonify, g, session
 from werkzeug.security import generate_password_hash, check_password_hash
 
 # Handle PostgreSQL on Render or SQLite locally
 DATABASE_URL = os.environ.get('DATABASE_URL')
 
 app = Flask(__name__)
-app.secret_key = os.environ.get('SECRET_KEY', 'savers_growth_31day_cycle_key_2026')
+app.secret_key = os.environ.get('SECRET_KEY', 'savers_growth_31day_cycle_key_2026_secured')
 
 # -----------------------------------------------------------------------------
-# DATABASE SETUP
+# DATABASE SETUP & SPEED INDEXING
 # -----------------------------------------------------------------------------
 def get_db():
     if 'db' not in g:
@@ -32,10 +32,14 @@ def close_db(error):
     if db is not None:
         db.close()
 
+def query_param():
+    return "%s" if DATABASE_URL else "?"
+
 def init_db():
     with app.app_context():
         db = get_db()
         cursor = db.cursor()
+        p = query_param()
 
         is_postgres = bool(DATABASE_URL)
         pk_type = "SERIAL PRIMARY KEY" if is_postgres else "INTEGER PRIMARY KEY AUTOINCREMENT"
@@ -47,7 +51,7 @@ def init_db():
                 full_name TEXT NOT NULL,
                 phone TEXT DEFAULT '',
                 email TEXT DEFAULT '',
-                username TEXT DEFAULT '',
+                username TEXT UNIQUE,
                 password_hash TEXT DEFAULT '',
                 daily_target REAL DEFAULT 500.0,
                 current_cycle INTEGER DEFAULT 1,
@@ -130,28 +134,93 @@ def init_db():
             )
         ''')
 
+        # SPEED OPTIMIZATION: Database Indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_members_mid ON members(member_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_members_uname ON members(username)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_savings_mid ON savings(member_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_loans_mid ON loans(member_id)")
+
         db.commit()
 
-        cursor.execute('SELECT COUNT(*) FROM admin_users')
+        # Seed Primary Admin User (Saversadmin)
+        admin_pass_hash = generate_password_hash('saversrotimi1972')
+        cursor.execute(f"SELECT COUNT(*) FROM admin_users WHERE username = {p}", ('Saversadmin',))
         row = cursor.fetchone()
-        count = row[0] if row else 0
-        if count == 0:
-            default_hash = generate_password_hash('admin123')
-            if is_postgres:
-                cursor.execute('INSERT INTO admin_users (username, password_hash) VALUES (%s, %s)', ('admin', default_hash))
-            else:
-                cursor.execute('INSERT INTO admin_users (username, password_hash) VALUES (?, ?)', ('admin', default_hash))
+        if not row or row[0] == 0:
+            cursor.execute(f"INSERT INTO admin_users (username, password_hash) VALUES ({p}, {p})", ('Saversadmin', admin_pass_hash))
+            db.commit()
+
+        # Seed Member #1: Oladele Rotimi Williams (SVR0001) as Admin/Owner
+        cursor.execute(f"SELECT COUNT(*) FROM members WHERE member_id = {p}", ('SVR0001',))
+        row_m = cursor.fetchone()
+        if not row_m or row_m[0] == 0:
+            cursor.execute(f'''
+                INSERT INTO members (member_id, full_name, phone, username, password_hash, daily_target, current_cycle, cycle_days, status)
+                VALUES ({p}, {p}, {p}, {p}, {p}, 1000.0, 1, 0, 'Owner/Admin')
+            ''', ('SVR0001', 'Oladele Rotimi Williams', '09018363715', 'Saversadmin', admin_pass_hash))
             db.commit()
 
 with app.app_context():
     init_db()
 
 # -----------------------------------------------------------------------------
-# REST API ENDPOINTS
+# AUTHENTICATION API ENDPOINTS
 # -----------------------------------------------------------------------------
 
-def query_param():
-    return "%s" if DATABASE_URL else "?"
+@app.route('/api/auth/login', methods=['POST'])
+def login():
+    data = request.json or {}
+    username = data.get('username', '').strip()
+    password = data.get('password', '').strip()
+
+    if not username or not password:
+        return jsonify({'success': False, 'message': 'Username and password required.'}), 400
+
+    db = get_db()
+    cursor = db.cursor()
+    p = query_param()
+
+    # 1. Check Admin Account First
+    cursor.execute(f"SELECT * FROM admin_users WHERE username = {p}", (username,))
+    admin = cursor.fetchone()
+    if admin and check_password_hash(admin['password_hash'], password):
+        session['user_id'] = admin['username']
+        session['role'] = 'admin'
+        session['member_id'] = 'SVR0001'
+        session['full_name'] = 'Oladele Rotimi Williams'
+        return jsonify({'success': True, 'role': 'admin', 'name': 'Oladele Rotimi Williams', 'member_id': 'SVR0001'})
+
+    # 2. Check Member Accounts
+    cursor.execute(f"SELECT * FROM members WHERE username = {p} OR member_id = {p}", (username, username))
+    member = cursor.fetchone()
+    if member and member['password_hash'] and check_password_hash(member['password_hash'], password):
+        session['user_id'] = member['username'] or member['member_id']
+        session['role'] = 'admin' if member['status'] == 'Owner/Admin' else 'member'
+        session['member_id'] = member['member_id']
+        session['full_name'] = member['full_name']
+        return jsonify({'success': True, 'role': session['role'], 'name': member['full_name'], 'member_id': member['member_id']})
+
+    return jsonify({'success': False, 'message': 'Invalid username or password.'}), 401
+
+@app.route('/api/auth/logout', methods=['POST'])
+def logout():
+    session.clear()
+    return jsonify({'success': True, 'message': 'Logged out successfully.'})
+
+@app.route('/api/auth/me', methods=['GET'])
+def get_current_user():
+    if 'role' in session:
+        return jsonify({
+            'logged_in': True,
+            'role': session.get('role'),
+            'member_id': session.get('member_id'),
+            'full_name': session.get('full_name')
+        })
+    return jsonify({'logged_in': False})
+
+# -----------------------------------------------------------------------------
+# REST API ENDPOINTS
+# -----------------------------------------------------------------------------
 
 @app.route('/api/stats/overview', methods=['GET'])
 def get_wallet_overview():
@@ -206,11 +275,14 @@ def manage_members():
             count += 1
             member_id = f"SVR{count:04d}"
 
+        default_username = f"user_{member_id.lower()}"
+        default_pass_hash = generate_password_hash("savers123")
+
         try:
             cursor.execute(f'''
-                INSERT INTO members (member_id, full_name, phone, email, username, daily_target, current_cycle, cycle_days, status)
-                VALUES ({p}, {p}, '', '', {p}, {p}, 1, 0, 'active')
-            ''', (member_id, full_name, full_name.split()[0], daily_target))
+                INSERT INTO members (member_id, full_name, phone, email, username, password_hash, daily_target, current_cycle, cycle_days, status)
+                VALUES ({p}, {p}, '', '', {p}, {p}, {p}, 1, 0, 'active')
+            ''', (member_id, full_name, default_username, default_pass_hash, daily_target))
             db.commit()
             return jsonify({'success': True, 'message': f'Member registered! ID: {member_id}', 'member_id': member_id})
         except Exception as e:
@@ -235,7 +307,7 @@ def manage_members():
                 'full_name': r['full_name'],
                 'phone': r['phone'] or '',
                 'email': r['email'] or '',
-                'username': r['username'] or r['full_name'].split()[0],
+                'username': r['username'] or '',
                 'daily_target': r['daily_target'],
                 'current_cycle': r['current_cycle'],
                 'cycle_days': r['cycle_days'],
@@ -274,19 +346,31 @@ def member_detail_update_delete(member_id):
     elif request.method == 'PUT':
         data = request.json or {}
         full_name = data.get('full_name', '').strip()
+        username = data.get('username', '').strip()
+        new_password = data.get('password', '').strip()
         raw_target = data.get('daily_target')
+        
         try:
             daily_target = float(raw_target) if raw_target not in (None, '') else 500.0
         except (ValueError, TypeError):
             daily_target = 500.0
 
-        cursor.execute(f'''
-            UPDATE members 
-            SET full_name = {p}, daily_target = {p}
-            WHERE member_id = {p}
-        ''', (full_name, daily_target, member_id))
+        if new_password:
+            pass_hash = generate_password_hash(new_password)
+            cursor.execute(f'''
+                UPDATE members 
+                SET full_name = {p}, username = {p}, password_hash = {p}, daily_target = {p}
+                WHERE member_id = {p}
+            ''', (full_name, username, pass_hash, daily_target, member_id))
+        else:
+            cursor.execute(f'''
+                UPDATE members 
+                SET full_name = {p}, username = {p}, daily_target = {p}
+                WHERE member_id = {p}
+            ''', (full_name, username, daily_target, member_id))
+
         db.commit()
-        return jsonify({'success': True, 'message': 'Member profile updated!'})
+        return jsonify({'success': True, 'message': 'Member profile & credentials updated!'})
 
     else:
         cursor.execute(f'''
@@ -303,7 +387,7 @@ def member_detail_update_delete(member_id):
 
         member_id_actual = m['member_id']
 
-        # FETCH ONLY LAST 5 CONTRIBUTIONS
+        # FETCH LAST 5 CONTRIBUTIONS ONLY
         cursor.execute(f'''
             SELECT id, amount, date, notes, is_service_fee, days_credited 
             FROM savings 
@@ -318,6 +402,7 @@ def member_detail_update_delete(member_id):
                 'id': m['id'],
                 'member_id': m['member_id'],
                 'full_name': m['full_name'],
+                'username': m['username'] or '',
                 'daily_target': m['daily_target'],
                 'current_cycle': m['current_cycle'],
                 'cycle_days': m['cycle_days'],
@@ -583,7 +668,7 @@ def repay_loan():
     return jsonify({'success': True, 'message': 'Loan repayment recorded!'})
 
 # -----------------------------------------------------------------------------
-# DAILY TRACKER
+# DAILY TRACKER & SERVICE FEES
 # -----------------------------------------------------------------------------
 @app.route('/api/tracker/daily', methods=['GET'])
 def get_daily_tracker():
@@ -622,9 +707,6 @@ def get_daily_tracker():
         'net_cashflow': net_cashflow
     })
 
-# -----------------------------------------------------------------------------
-# SERVICE FEES
-# -----------------------------------------------------------------------------
 @app.route('/api/service-fees', methods=['GET'])
 def get_service_fees():
     db = get_db()
@@ -690,12 +772,12 @@ def update_password():
     if not old_pass or not new_pass:
         return jsonify({'success': False, 'message': 'Both existing and new password required.'}), 400
 
-    cursor.execute("SELECT password_hash FROM admin_users WHERE username = 'admin'")
+    cursor.execute("SELECT password_hash FROM admin_users WHERE username = 'Saversadmin'")
     row = cursor.fetchone()
 
     if row and check_password_hash(row['password_hash'], old_pass):
         new_hash = generate_password_hash(new_pass)
-        cursor.execute(f"UPDATE admin_users SET password_hash = {p} WHERE username = 'admin'", (new_hash,))
+        cursor.execute(f"UPDATE admin_users SET password_hash = {p} WHERE username = 'Saversadmin'", (new_hash,))
         db.commit()
         return jsonify({'success': True, 'message': 'Admin password updated successfully!'})
     else:
@@ -710,7 +792,7 @@ INDEX_TEMPLATE = """
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Savers Growth</title>
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
@@ -732,7 +814,7 @@ INDEX_TEMPLATE = """
             --radius-card: 16px;
         }
 
-        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Plus Jakarta Sans', sans-serif; }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Plus Jakarta Sans', sans-serif; -webkit-tap-highlight-color: transparent; }
 
         body {
             background-color: var(--bg-body);
@@ -741,19 +823,20 @@ INDEX_TEMPLATE = """
         }
 
         /* Toast Notifications */
-        #toast-container { position: fixed; top: 20px; right: 20px; z-index: 9999; }
+        #toast-container { position: fixed; top: 16px; right: 16px; z-index: 9999; }
         .toast {
-            background: #1e293b; color: #fff; padding: 12px 20px; border-radius: 12px;
-            margin-bottom: 10px; box-shadow: 0 8px 20px rgba(0,0,0,0.15);
-            display: flex; align-items: center; gap: 10px; animation: slideIn 0.3s forwards;
-            font-size: 0.9rem; font-weight: 600;
+            background: #1e293b; color: #fff; padding: 12px 18px; border-radius: 12px;
+            margin-bottom: 8px; box-shadow: 0 8px 20px rgba(0,0,0,0.15);
+            display: flex; align-items: center; gap: 8px; animation: slideIn 0.25s forwards;
+            font-size: 0.88rem; font-weight: 600;
         }
         .toast.success { background: var(--primary-green-dark); }
         .toast.error { background: var(--primary-red); }
         @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
 
+        /* Header */
         header {
-            background: #ffffff; padding: 0.85rem 1.25rem;
+            background: #ffffff; padding: 0.85rem 1rem;
             display: flex; justify-content: space-between; align-items: center;
             border-bottom: 1.5px solid var(--border-light);
             position: sticky; top: 0; z-index: 100;
@@ -761,65 +844,79 @@ INDEX_TEMPLATE = """
         header .brand-box { display: flex; align-items: center; gap: 10px; cursor: pointer; }
         header .sprout-icon {
             background: var(--primary-green); color: #ffffff;
-            width: 36px; height: 38px; border-radius: 50%;
-            display: flex; align-items: center; justify-content: center; font-size: 1.15rem;
+            width: 36px; height: 36px; border-radius: 50%;
+            display: flex; align-items: center; justify-content: center; font-size: 1.1rem;
         }
-        header .brand-title { font-size: 1.35rem; font-weight: 800; color: var(--text-dark); letter-spacing: -0.3px; }
+        header .brand-title { font-size: 1.25rem; font-weight: 800; color: var(--text-dark); letter-spacing: -0.3px; }
         header .btn-logout {
             background: #ffffff; color: var(--text-dark); border: 1.5px solid var(--text-dark);
-            padding: 6px 14px; border-radius: 20px; font-weight: 700; font-size: 0.85rem;
-            cursor: pointer; display: flex; align-items: center; gap: 6px;
+            padding: 6px 14px; border-radius: 20px; font-weight: 700; font-size: 0.82rem;
+            cursor: pointer; min-height: 36px;
         }
 
-        .search-container { padding: 0.85rem 1.25rem 0.5rem 1.25rem; max-width: 600px; margin: 0 auto; width: 100%; position: relative; }
+        /* Search Bar */
+        .search-container { padding: 0.85rem 1rem 0.4rem 1rem; max-width: 600px; margin: 0 auto; width: 100%; position: relative; }
         .search-wrapper { position: relative; width: 100%; }
-        .search-wrapper i { position: absolute; left: 16px; top: 50%; transform: translateY(-50%); color: #94a3b8; font-size: 1rem; }
+        .search-wrapper i { position: absolute; left: 16px; top: 50%; transform: translateY(-50%); color: #94a3b8; font-size: 0.95rem; }
         .search-input {
             width: 100%; padding: 10px 16px 10px 42px; border-radius: 30px;
             border: 1.5px solid var(--border-light); font-size: 0.9rem; outline: none; background: #ffffff;
         }
         .search-results-dropdown {
-            position: absolute; top: 100%; left: 1.25rem; right: 1.25rem; background: #ffffff;
+            position: absolute; top: 100%; left: 1rem; right: 1rem; background: #ffffff;
             border: 1.5px solid var(--border-light); border-radius: 16px; box-shadow: 0 10px 25px rgba(0,0,0,0.1);
-            z-index: 500; max-height: 250px; overflow-y: auto; display: none; margin-top: 4px;
+            z-index: 500; max-height: 240px; overflow-y: auto; display: none; margin-top: 4px;
         }
         .search-result-item {
             padding: 12px 16px; border-bottom: 1px solid var(--border-light); cursor: pointer;
-            display: flex; justify-content: space-between; align-items: center; font-size: 0.9rem; font-weight: 600;
+            display: flex; justify-content: space-between; align-items: center; font-size: 0.88rem; font-weight: 600;
         }
-        .search-result-item:hover { background: #f1f5f9; }
 
-        .app-container { max-width: 600px; margin: 0 auto; width: 100%; padding: 0.5rem 1.25rem 2rem 1.25rem; flex: 1; }
+        .app-container { max-width: 600px; margin: 0 auto; width: 100%; padding: 0.5rem 1rem 2rem 1rem; flex: 1; }
 
         .view-section { display: none; }
-        .view-section.active { display: block; animation: fadeIn 0.25s forwards; }
+        .view-section.active { display: block; animation: fadeIn 0.2s forwards; }
         @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
 
-        .view-header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.25rem; }
-        .view-title-group { display: flex; align-items: center; gap: 10px; font-size: 1.2rem; font-weight: 800; }
+        .view-header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.1rem; }
+        .view-title-group { display: flex; align-items: center; gap: 8px; font-size: 1.15rem; font-weight: 800; }
         .btn-back {
             background: #e2e8f0; color: var(--text-dark); border: none;
-            padding: 6px 14px; border-radius: 8px; font-weight: 700; font-size: 0.85rem; cursor: pointer;
+            padding: 8px 14px; border-radius: 10px; font-weight: 700; font-size: 0.82rem; cursor: pointer;
         }
         .btn-add-header {
             background: var(--primary-green); color: #ffffff; border: none;
-            padding: 6px 14px; border-radius: 8px; font-weight: 700; font-size: 0.85rem; cursor: pointer;
+            padding: 8px 14px; border-radius: 10px; font-weight: 700; font-size: 0.82rem; cursor: pointer;
             display: flex; align-items: center; gap: 6px;
         }
+
+        /* Login Screen Card */
+        .login-card {
+            background: #ffffff; border: 1.5px solid var(--border-light);
+            border-radius: 20px; padding: 1.75rem 1.25rem; max-width: 420px; margin: 2rem auto;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.03);
+        }
+        .login-header { text-align: center; margin-bottom: 1.5rem; }
+        .login-header .sprout-big {
+            background: var(--primary-green); color: #fff; width: 56px; height: 56px;
+            border-radius: 50%; display: inline-flex; align-items: center; justify-content: center;
+            font-size: 1.8rem; margin-bottom: 10px;
+        }
+        .login-header h2 { font-size: 1.35rem; font-weight: 800; color: var(--text-dark); }
 
         /* 3-COLUMN HOMEPAGE GRID */
         .grid-3-col {
             display: grid;
             grid-template-columns: repeat(3, 1fr);
-            gap: 12px;
-            margin-top: 0.5rem;
+            gap: 10px;
+            margin-top: 0.4rem;
         }
 
         .menu-card {
             background: var(--card-bg);
             border: 1.5px solid var(--border-light);
             border-radius: var(--radius-card);
-            padding: 1rem 0.4rem;
+            padding: 0.85rem 0.3rem;
             display: flex;
             flex-direction: column;
             align-items: center;
@@ -827,15 +924,15 @@ INDEX_TEMPLATE = """
             text-align: center;
             cursor: pointer;
             box-shadow: 0 2px 4px rgba(0,0,0,0.02);
-            transition: all 0.2s;
-            min-height: 96px;
+            transition: all 0.15s;
+            min-height: 92px;
         }
-        .menu-card:hover { border-color: var(--primary-green); transform: translateY(-2px); }
+        .menu-card:active { transform: scale(0.97); }
         
         .menu-card .icon-badge {
-            width: 38px; height: 38px; border-radius: 12px;
+            width: 36px; height: 36px; border-radius: 10px;
             display: flex; align-items: center; justify-content: center;
-            font-size: 1.2rem; margin-bottom: 6px;
+            font-size: 1.1rem; margin-bottom: 4px;
         }
         .icon-badge.pink { background: #ffe4e6; }
         .icon-badge.mint { background: #d1fae5; }
@@ -845,7 +942,7 @@ INDEX_TEMPLATE = """
         .icon-badge.teal { background: #ccfbf1; }
 
         .menu-card .card-heading {
-            font-size: 0.82rem;
+            font-size: 0.8rem;
             font-weight: 800;
             color: var(--text-dark);
             line-height: 1.15;
@@ -854,57 +951,56 @@ INDEX_TEMPLATE = """
         .grid-row-4-center {
             display: flex;
             justify-content: center;
-            gap: 12px;
-            margin-top: 12px;
+            gap: 10px;
+            margin-top: 10px;
         }
         .grid-row-4-center .menu-card {
-            width: calc(33.333% - 8px);
+            width: calc(33.333% - 6px);
         }
 
         .overview-box {
             background: #f0fdf4; border: 1.5px solid #bbf7d0; border-radius: 16px;
-            padding: 1.25rem 1.5rem; margin-bottom: 1.5rem; display: flex; flex-direction: column; gap: 12px;
+            padding: 1.25rem; margin-bottom: 1.25rem; display: flex; flex-direction: column; gap: 10px;
         }
-        .overview-row { display: flex; justify-content: space-between; align-items: center; font-size: 0.95rem; font-weight: 600; }
-        .overview-row .amount-saved { font-size: 1.15rem; font-weight: 800; color: var(--primary-green-dark); }
-        .overview-row .amount-fees { font-size: 1.15rem; font-weight: 800; color: var(--amber-fee); }
-        .overview-row .amount-net { font-size: 1.25rem; font-weight: 800; color: var(--primary-green-dark); }
-        .overview-divider { height: 1px; background: #cbd5e1; margin: 4px 0; }
+        .overview-row { display: flex; justify-content: space-between; align-items: center; font-size: 0.9rem; font-weight: 600; }
+        .overview-row .amount-saved { font-size: 1.1rem; font-weight: 800; color: var(--primary-green-dark); }
+        .overview-row .amount-fees { font-size: 1.1rem; font-weight: 800; color: var(--amber-fee); }
+        .overview-row .amount-net { font-size: 1.2rem; font-weight: 800; color: var(--primary-green-dark); }
+        .overview-divider { height: 1px; background: #cbd5e1; margin: 2px 0; }
 
-        .action-stack { display: flex; flex-direction: column; gap: 0.85rem; }
+        .action-stack { display: flex; flex-direction: column; gap: 0.75rem; }
         .btn-action-primary {
             background: var(--primary-red); color: white; border: none; padding: 14px;
-            border-radius: 12px; font-weight: 800; font-size: 1rem; cursor: pointer;
-            display: flex; align-items: center; justify-content: center; gap: 8px;
+            border-radius: 12px; font-weight: 800; font-size: 0.95rem; cursor: pointer;
+            display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 48px;
         }
         .btn-action-secondary {
             background: #e2e8f0; color: var(--text-dark); border: none; padding: 14px;
-            border-radius: 12px; font-weight: 800; font-size: 1rem; cursor: pointer;
-            display: flex; align-items: center; justify-content: center; gap: 8px;
+            border-radius: 12px; font-weight: 800; font-size: 0.95rem; cursor: pointer;
+            display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 48px;
         }
 
-        .filter-row { display: flex; gap: 10px; margin-bottom: 1.25rem; }
-        .filter-row input { flex: 1; padding: 12px 16px; border-radius: 12px; border: 1.5px solid var(--border-light); font-size: 0.9rem; background: #fff; }
+        .filter-row { display: flex; gap: 8px; margin-bottom: 1rem; }
+        .filter-row input { flex: 1; padding: 10px 14px; border-radius: 12px; border: 1.5px solid var(--border-light); font-size: 0.88rem; background: #fff; }
 
         .member-card-item {
             background: #ffffff; border: 1.5px solid var(--border-light);
-            border-radius: 20px; padding: 1.25rem; margin-bottom: 1rem;
-            cursor: pointer; box-shadow: 0 2px 4px rgba(0,0,0,0.01); transition: all 0.2s;
+            border-radius: 18px; padding: 1.1rem; margin-bottom: 0.85rem;
+            cursor: pointer; box-shadow: 0 2px 4px rgba(0,0,0,0.01);
         }
-        .member-card-item:hover { border-color: var(--primary-green); }
-        .member-card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
-        .member-avatar-group { display: flex; align-items: center; gap: 14px; }
+        .member-card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+        .member-avatar-group { display: flex; align-items: center; gap: 12px; }
         .member-avatar {
-            width: 48px; height: 48px; border-radius: 50%; background: #d1fae5; color: #059669;
-            display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 1.3rem;
+            width: 44px; height: 44px; border-radius: 50%; background: #d1fae5; color: #059669;
+            display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 1.2rem;
         }
-        .member-info .name { font-size: 1.1rem; font-weight: 800; color: var(--text-dark); margin-bottom: 2px; }
-        .member-info .code { font-size: 0.9rem; color: #94a3b8; font-weight: 600; letter-spacing: 0.5px; }
+        .member-info .name { font-size: 1.05rem; font-weight: 800; color: var(--text-dark); margin-bottom: 2px; }
+        .member-info .code { font-size: 0.85rem; color: #94a3b8; font-weight: 600; }
 
         .member-stats-box {
-            background: #f8fafc; border-radius: 12px; padding: 12px 16px;
-            display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
-            font-size: 0.9rem; margin-bottom: 12px;
+            background: #f8fafc; border-radius: 12px; padding: 10px 14px;
+            display: grid; grid-template-columns: 1fr 1fr; gap: 6px;
+            font-size: 0.85rem; margin-bottom: 10px;
         }
         .stat-line { font-weight: 600; color: var(--text-dark); }
         .stat-line .val-green { color: var(--primary-green-dark); font-weight: 800; }
@@ -912,79 +1008,78 @@ INDEX_TEMPLATE = """
 
         .cycle-status-btn {
             background: var(--purple-bg); border: 1px solid var(--purple-border); color: var(--purple-cycle);
-            padding: 10px; border-radius: 12px; text-align: center; font-weight: 700; font-size: 0.88rem;
+            padding: 8px; border-radius: 10px; text-align: center; font-weight: 700; font-size: 0.82rem;
             display: flex; align-items: center; justify-content: center; gap: 6px;
         }
 
+        /* Modals */
         .modal-overlay {
             position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-            background: rgba(15, 23, 42, 0.6); backdrop-filter: blur(4px);
-            z-index: 1000; display: none; align-items: center; justify-content: center; padding: 1rem;
+            background: rgba(15, 23, 42, 0.6); backdrop-filter: blur(3px);
+            z-index: 1000; display: none; align-items: center; justify-content: center; padding: 0.85rem;
         }
         .modal-overlay.active { display: flex; }
         .modal-card {
-            background: #ffffff; border-radius: 24px; width: 100%; max-width: 500px;
-            max-height: 92vh; overflow-y: auto; padding: 1.5rem; box-shadow: 0 20px 25px -5px rgba(0,0,0,0.1);
+            background: #ffffff; border-radius: 20px; width: 100%; max-width: 480px;
+            max-height: 90vh; overflow-y: auto; padding: 1.25rem; box-shadow: 0 20px 25px -5px rgba(0,0,0,0.1);
             animation: modalUp 0.2s forwards;
         }
-        @keyframes modalUp { from { transform: translateY(20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+        @keyframes modalUp { from { transform: translateY(15px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
 
-        .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }
-        .modal-title { font-size: 1.2rem; font-weight: 800; color: var(--text-dark); }
-        .modal-close { background: none; border: none; font-size: 1.6rem; color: var(--text-muted); cursor: pointer; }
+        .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.85rem; }
+        .modal-title { font-size: 1.1rem; font-weight: 800; color: var(--text-dark); }
+        .modal-close { background: none; border: none; font-size: 1.5rem; color: var(--text-muted); cursor: pointer; }
 
         .modal-nav-tabs {
-            display: flex; gap: 8px; overflow-x: auto; padding-bottom: 8px; margin-bottom: 1.25rem;
+            display: flex; gap: 6px; overflow-x: auto; padding-bottom: 6px; margin-bottom: 1rem;
             border-bottom: 1px solid var(--border-light);
         }
         .modal-tab {
-            padding: 8px 16px; border-radius: 20px; font-size: 0.85rem; font-weight: 700;
+            padding: 6px 12px; border-radius: 16px; font-size: 0.8rem; font-weight: 700;
             border: 1px solid var(--border-light); cursor: pointer; white-space: nowrap; color: var(--text-muted);
-            background: #ffffff; transition: all 0.2s;
+            background: #ffffff;
         }
         .modal-tab.active { background: #f0fdf4; border-color: #bbf7d0; color: var(--primary-green-dark); }
 
         .modal-tab-panel { display: none; }
         .modal-tab-panel.active { display: block; }
 
-        .modal-details-list { display: flex; flex-direction: column; gap: 10px; font-size: 0.95rem; margin-bottom: 1.25rem; }
+        .modal-details-list { display: flex; flex-direction: column; gap: 8px; font-size: 0.9rem; margin-bottom: 1rem; }
         .modal-detail-item { display: flex; justify-content: space-between; font-weight: 600; }
 
         .modal-cycle-box {
-            background: var(--purple-bg); border: 1.5px solid var(--purple-border); border-radius: 14px;
-            padding: 12px 16px; margin-bottom: 1.25rem;
+            background: var(--purple-bg); border: 1.5px solid var(--purple-border); border-radius: 12px;
+            padding: 10px 14px; margin-bottom: 1rem;
         }
-        .modal-cycle-box .lbl { font-size: 0.75rem; font-weight: 800; color: var(--purple-cycle); text-transform: uppercase; margin-bottom: 4px; }
-        .modal-cycle-box .val { font-weight: 800; color: var(--purple-cycle); font-size: 1rem; }
+        .modal-cycle-box .lbl { font-size: 0.72rem; font-weight: 800; color: var(--purple-cycle); text-transform: uppercase; margin-bottom: 2px; }
+        .modal-cycle-box .val { font-weight: 800; color: var(--purple-cycle); font-size: 0.95rem; }
 
-        .card-form { background: #fff; border: 1.5px solid var(--border-light); border-radius: 16px; padding: 1.25rem; }
-        .form-group { display: flex; flex-direction: column; gap: 6px; margin-bottom: 1rem; }
-        .form-group label { font-size: 0.85rem; font-weight: 700; color: var(--text-dark); }
+        .card-form { background: #fff; border: 1.5px solid var(--border-light); border-radius: 16px; padding: 1.1rem; }
+        .form-group { display: flex; flex-direction: column; gap: 5px; margin-bottom: 0.85rem; }
+        .form-group label { font-size: 0.82rem; font-weight: 700; color: var(--text-dark); }
         .form-control {
-            padding: 12px 14px; border-radius: 10px; border: 1.5px solid var(--border-light);
-            font-size: 0.95rem; outline: none; background: #fff; width: 100%;
+            padding: 11px 12px; border-radius: 10px; border: 1.5px solid var(--border-light);
+            font-size: 0.9rem; outline: none; background: #fff; width: 100%; min-height: 44px;
         }
         .btn-submit {
             background: var(--primary-green); color: white; border: none; padding: 12px;
-            border-radius: 10px; font-weight: 700; font-size: 0.95rem; cursor: pointer; width: 100%;
+            border-radius: 10px; font-weight: 700; font-size: 0.9rem; cursor: pointer; width: 100%; min-height: 46px;
         }
 
         .manage-subcard {
             background: #f8fafc; border: 1.5px solid var(--border-light);
-            border-radius: 14px; padding: 1rem; margin-bottom: 1rem;
+            border-radius: 12px; padding: 0.85rem; margin-bottom: 0.85rem;
         }
         .manage-subcard-title {
-            font-size: 0.95rem; font-weight: 800; margin-bottom: 0.75rem; display: flex; align-items: center; gap: 8px;
+            font-size: 0.88rem; font-weight: 800; margin-bottom: 0.6rem; display: flex; align-items: center; gap: 6px;
         }
 
         .table-responsive { overflow-x: auto; border-radius: 12px; border: 1.5px solid var(--border-light); }
-        table { width: 100%; border-collapse: collapse; text-align: left; font-size: 0.85rem; }
-        th, td { padding: 10px 12px; border-bottom: 1px solid var(--border-light); }
-        th { background: #f8fafc; font-weight: 700; color: var(--text-muted); text-transform: uppercase; font-size: 0.7rem; }
+        table { width: 100%; border-collapse: collapse; text-align: left; font-size: 0.82rem; }
+        th, td { padding: 9px 10px; border-bottom: 1px solid var(--border-light); }
+        th { background: #f8fafc; font-weight: 700; color: var(--text-muted); text-transform: uppercase; font-size: 0.68rem; }
         
-        .badge {
-            padding: 4px 8px; border-radius: 8px; font-size: 0.72rem; font-weight: 800; display: inline-block;
-        }
+        .badge { padding: 3px 6px; border-radius: 6px; font-size: 0.7rem; font-weight: 800; display: inline-block; }
         .badge-savings { background: #d1fae5; color: #065f46; }
         .badge-fee { background: #fef3c7; color: #92400e; }
         .badge-payout { background: #fee2e2; color: #991b1b; }
@@ -992,23 +1087,22 @@ INDEX_TEMPLATE = """
         .badge-warning { background: #fef3c7; color: #92400e; }
 
         .btn-delete-sm {
-            background: var(--primary-red); color: white; border: none; padding: 6px 12px;
-            border-radius: 8px; font-size: 0.75rem; font-weight: 700; cursor: pointer;
-            display: inline-flex; align-items: center; gap: 4px;
+            background: var(--primary-red); color: white; border: none; padding: 5px 10px;
+            border-radius: 6px; font-size: 0.72rem; font-weight: 700; cursor: pointer;
         }
         .btn-edit-sm {
-            background: #2563eb; color: white; border: none; padding: 6px 12px;
-            border-radius: 8px; font-size: 0.75rem; font-weight: 700; cursor: pointer; margin-right: 4px;
+            background: #2563eb; color: white; border: none; padding: 5px 10px;
+            border-radius: 6px; font-size: 0.72rem; font-weight: 700; cursor: pointer; margin-right: 2px;
         }
         .btn-repay-sm {
-            background: var(--primary-green-dark); color: white; border: none; padding: 6px 12px;
-            border-radius: 8px; font-size: 0.75rem; font-weight: 700; cursor: pointer;
+            background: var(--primary-green-dark); color: white; border: none; padding: 5px 10px;
+            border-radius: 6px; font-size: 0.72rem; font-weight: 700; cursor: pointer;
         }
 
         footer {
             background: #ffffff; color: var(--text-dark); text-align: center;
-            padding: 1.5rem 1rem; font-size: 0.9rem; font-weight: 700;
-            border-top: 1.5px solid var(--border-light); margin-top: auto; line-height: 1.5;
+            padding: 1.25rem 1rem; font-size: 0.85rem; font-weight: 700;
+            border-top: 1.5px solid var(--border-light); margin-top: auto; line-height: 1.4;
         }
     </style>
 </head>
@@ -1017,16 +1111,17 @@ INDEX_TEMPLATE = """
     <div id="toast-container"></div>
 
     <header>
-        <div class="brand-box" onclick="showSection('home')">
+        <div class="brand-box" onclick="handleHeaderClick()">
             <div class="sprout-icon"><i class="fa-solid fa-leaf"></i></div>
             <div class="brand-title">Savers Growth</div>
         </div>
-        <button class="btn-logout" onclick="showToast('Logged out', 'success')">
+        <button class="btn-logout" id="header-auth-btn" onclick="handleAuthAction()">
             Logout
         </button>
     </header>
 
-    <div class="search-container">
+    <!-- Search Container (Admin Only) -->
+    <div class="search-container" id="admin-search-container">
         <div class="search-wrapper">
             <i class="fa-solid fa-magnifying-glass"></i>
             <input type="text" class="search-input" id="global-search-input" 
@@ -1038,8 +1133,30 @@ INDEX_TEMPLATE = """
 
     <div class="app-container">
 
-        <!-- VIEW 1: HOMEPAGE GRID -->
-        <div id="view-home" class="view-section active">
+        <!-- VIEW 0: LOGIN SCREEN -->
+        <div id="view-login" class="view-section">
+            <div class="login-card">
+                <div class="login-header">
+                    <div class="sprout-big"><i class="fa-solid fa-leaf"></i></div>
+                    <h2>Savers Growth Login</h2>
+                    <p style="font-size: 0.85rem; color: var(--text-muted); margin-top: 4px;">Sign in to access your portal</p>
+                </div>
+                <form onsubmit="handleLoginSubmit(event)">
+                    <div class="form-group">
+                        <label>Username / Member ID</label>
+                        <input type="text" class="form-control" id="login-username" placeholder="Enter username or Member ID" required>
+                    </div>
+                    <div class="form-group">
+                        <label>Password</label>
+                        <input type="password" class="form-control" id="login-password" placeholder="Enter password" required>
+                    </div>
+                    <button type="submit" class="btn-submit" style="margin-top: 8px;">Login to System</button>
+                </form>
+            </div>
+        </div>
+
+        <!-- VIEW 1: ADMIN HOMEPAGE GRID -->
+        <div id="view-home" class="view-section">
             <div class="grid-3-col">
                 <div class="menu-card" onclick="showSection('overview')">
                     <div class="icon-badge pink">👛</div>
@@ -1100,6 +1217,50 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
+        <!-- VIEW 1B: MEMBER PRIVATE PORTAL -->
+        <div id="view-member-portal" class="view-section">
+            <div style="background: #ffffff; border: 1.5px solid var(--border-light); border-radius: 20px; padding: 1.25rem; margin-bottom: 1rem;">
+                <div style="font-size: 1.2rem; font-weight: 800; color: var(--text-dark);" id="mportal-name">Welcome Member</div>
+                <div style="font-size: 0.85rem; color: var(--text-muted);" id="mportal-id">ID: SVR0000</div>
+
+                <div class="overview-box" style="margin-top: 1rem; margin-bottom: 1rem;">
+                    <div class="overview-row">
+                        <span>Savings Balance:</span>
+                        <span class="amount-saved" id="mportal-balance">₦0.00</span>
+                    </div>
+                    <div class="overview-row">
+                        <span>Daily Target:</span>
+                        <span id="mportal-target" style="font-weight: 800;">₦0.00</span>
+                    </div>
+                    <div class="overview-divider"></div>
+                    <div class="overview-row">
+                        <span>Active Loan:</span>
+                        <span style="color: var(--primary-red); font-weight: 800;" id="mportal-loan">₦0.00</span>
+                    </div>
+                </div>
+
+                <div class="modal-cycle-box" style="margin-bottom: 1rem;">
+                    <div class="lbl">YOUR CYCLE STATUS:</div>
+                    <div class="val" id="mportal-cycle">🔄 Cycle 1 (0 / 31 days)</div>
+                </div>
+
+                <div style="font-size: 0.95rem; font-weight: 800; margin-bottom: 8px;">My Recent Savings (Last 5)</div>
+                <div class="table-responsive">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>DATE</th>
+                                <th>AMOUNT</th>
+                                <th>DAYS</th>
+                            </tr>
+                        </thead>
+                        <tbody id="mportal-savings-table"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- VIEW 2: WALLET OVERVIEW -->
         <div id="view-overview" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">👛 Wallet Overview</div>
@@ -1132,7 +1293,7 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 3: MEMBERS DIRECTORY (WITH ADD MEMBER BUTTON BESIDE BACK BUTTON) -->
+        <!-- VIEW 3: MEMBERS DIRECTORY -->
         <div id="view-members" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">👥 Members Directory</div>
@@ -1151,6 +1312,7 @@ INDEX_TEMPLATE = """
             <div id="members-cards-container"></div>
         </div>
 
+        <!-- VIEW 4: RECORD SAVINGS -->
         <div id="view-savings" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">➕ Record Savings</div>
@@ -1179,6 +1341,7 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
+        <!-- VIEW 5: PROCESS WITHDRAWAL -->
         <div id="view-withdrawal" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">🏧 Process Withdrawal</div>
@@ -1210,6 +1373,7 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
+        <!-- VIEW 6: LOANS LEDGER -->
         <div id="view-loans" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">💳 Loans Ledger</div>
@@ -1234,6 +1398,7 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
+        <!-- VIEW 7: DAILY TRACKER -->
         <div id="view-tracker" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">📊 Daily Tracker</div>
@@ -1272,6 +1437,7 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
+        <!-- VIEW 8: MONTHLY SERVICE FEES -->
         <div id="view-service-fees" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">🏢 Monthly Service Fees</div>
@@ -1301,6 +1467,7 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
+        <!-- VIEW 9: REGISTER MEMBER -->
         <div id="view-register" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">🆔 Register Member</div>
@@ -1321,6 +1488,7 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
+        <!-- VIEW 10: MANAGE MEMBERS -->
         <div id="view-manage-members" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">⚙️ Manage Members</div>
@@ -1342,6 +1510,7 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
+        <!-- VIEW 11: MAINTENANCE -->
         <div id="view-maintenance" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">🛠️ System Maintenance</div>
@@ -1373,6 +1542,7 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
+        <!-- VIEW 12: PASSWORD -->
         <div id="view-password" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">🔐 Update Password</div>
@@ -1388,7 +1558,7 @@ INDEX_TEMPLATE = """
                         <label>New Password</label>
                         <input type="password" class="form-control" id="pass-new" required>
                     </div>
-                    <button type="submit" class="btn-submit">Update Credentials</button>
+                    <button type="submit" class="btn-submit">Update Admin Password</button>
                 </form>
             </div>
         </div>
@@ -1408,7 +1578,7 @@ INDEX_TEMPLATE = """
                 <div class="modal-tab" onclick="switchModalTab('save')">➕ Save</div>
                 <div class="modal-tab" onclick="switchModalTab('withdraw')">🏧 Withdraw</div>
                 <div class="modal-tab" onclick="switchModalTab('loans')">💳 Issue Loan</div>
-                <div class="modal-tab" onclick="switchModalTab('manage')">⚙️ Edit / Delete</div>
+                <div class="modal-tab" onclick="switchModalTab('manage')">⚙️ Edit / Credentials</div>
             </div>
 
             <div id="modal-panel-overview" class="modal-tab-panel active">
@@ -1492,7 +1662,7 @@ INDEX_TEMPLATE = """
             <div id="modal-panel-manage" class="modal-tab-panel">
                 <div class="manage-subcard">
                     <div class="manage-subcard-title" style="color:var(--primary-green-dark);">
-                        <i class="fa-solid fa-pen-to-square"></i> ✏️ Edit Profile Details
+                        <i class="fa-solid fa-pen-to-square"></i> ✏️ Edit Profile & Login Credentials
                     </div>
                     <form onsubmit="handleModalUpdateMember(event)">
                         <div class="form-group">
@@ -1501,9 +1671,17 @@ INDEX_TEMPLATE = """
                         </div>
                         <div class="form-group">
                             <label>Daily Target Amount (₦)</label>
-                            <input type="number" step="0.01" class="form-control" id="modal-edit-target" placeholder="e.g. 1000" required>
+                            <input type="number" step="0.01" class="form-control" id="modal-edit-target" required>
                         </div>
-                        <button type="submit" class="btn-submit">Save Changes</button>
+                        <div class="form-group">
+                            <label>Member Username</label>
+                            <input type="text" class="form-control" id="modal-edit-username" placeholder="e.g. sunday123">
+                        </div>
+                        <div class="form-group">
+                            <label>New Password (Leave blank to keep unchanged)</label>
+                            <input type="password" class="form-control" id="modal-edit-password" placeholder="Enter new password">
+                        </div>
+                        <button type="submit" class="btn-submit">Save Changes & Credentials</button>
                     </form>
                 </div>
 
@@ -1562,6 +1740,7 @@ INDEX_TEMPLATE = """
 
         let globalMembers = [];
         let currentModalMember = null;
+        let currentUser = null;
         let confirmResolver = null;
         let promptResolver = null;
 
@@ -1611,7 +1790,111 @@ INDEX_TEMPLATE = """
         }
 
         function formatNaira(val) {
-            return '₦' + parseFloat(val).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+            return '₦' + parseFloat(val || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        }
+
+        async function checkAuthSession() {
+            try {
+                const res = await fetch('/api/auth/me');
+                const data = await res.json();
+
+                if (data.logged_in) {
+                    currentUser = data;
+                    document.getElementById('header-auth-btn').innerText = 'Logout';
+                    
+                    if (data.role === 'admin') {
+                        document.getElementById('admin-search-container').style.display = 'block';
+                        fetchAndRenderMembers();
+                        showSection('home');
+                    } else {
+                        document.getElementById('admin-search-container').style.display = 'none';
+                        loadMemberPrivatePortal(data.member_id);
+                    }
+                } else {
+                    currentUser = null;
+                    document.getElementById('header-auth-btn').innerText = 'Login';
+                    document.getElementById('admin-search-container').style.display = 'none';
+                    showSection('login');
+                }
+            } catch (err) {
+                showSection('login');
+            }
+        }
+
+        async function handleLoginSubmit(e) {
+            e.preventDefault();
+            const username = document.getElementById('login-username').value.trim();
+            const password = document.getElementById('login-password').value.trim();
+
+            const res = await fetch('/api/auth/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username, password })
+            });
+            const result = await res.json();
+
+            if (result.success) {
+                showToast(`Welcome back, ${result.name}!`);
+                document.getElementById('login-username').value = '';
+                document.getElementById('login-password').value = '';
+                checkAuthSession();
+            } else {
+                showToast(result.message, 'error');
+            }
+        }
+
+        async function handleAuthAction() {
+            if (currentUser) {
+                await fetch('/api/auth/logout', { method: 'POST' });
+                currentUser = null;
+                showToast('Logged out');
+                checkAuthSession();
+            } else {
+                showSection('login');
+            }
+        }
+
+        function handleHeaderClick() {
+            if (currentUser) {
+                if (currentUser.role === 'admin') showSection('home');
+                else loadMemberPrivatePortal(currentUser.member_id);
+            } else {
+                showSection('login');
+            }
+        }
+
+        async function loadMemberPrivatePortal(memberId) {
+            const res = await fetch(`/api/member/${memberId}`);
+            const data = await res.json();
+
+            if (data.success) {
+                const m = data.member;
+                document.getElementById('mportal-name').innerText = m.full_name;
+                document.getElementById('mportal-id').innerText = `ID: ${m.member_id}`;
+                document.getElementById('mportal-balance').innerText = formatNaira(m.net_balance);
+                document.getElementById('mportal-target').innerText = formatNaira(m.daily_target);
+                document.getElementById('mportal-loan').innerText = formatNaira(m.active_loan);
+                document.getElementById('mportal-cycle').innerText = `🔄 Cycle ${m.current_cycle} (${m.cycle_days} / 31 days)`;
+
+                const tbody = document.getElementById('mportal-savings-table');
+                tbody.innerHTML = '';
+
+                if (data.recent_savings.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="3" style="text-align:center; color:var(--text-muted);">No savings recorded yet.</td></tr>';
+                } else {
+                    data.recent_savings.forEach(s => {
+                        tbody.innerHTML += `
+                            <tr>
+                                <td>${s.date}</td>
+                                <td style="color:var(--primary-green-dark); font-weight:800;">${formatNaira(s.amount)}</td>
+                                <td>${s.days_credited}</td>
+                            </tr>
+                        `;
+                    });
+                }
+
+                showSection('member-portal');
+            }
         }
 
         function showSection(sectionId) {
@@ -1735,6 +2018,8 @@ INDEX_TEMPLATE = """
 
             document.getElementById('modal-edit-fullname').value = m.full_name;
             document.getElementById('modal-edit-target').value = m.daily_target;
+            document.getElementById('modal-edit-username').value = m.username || '';
+            document.getElementById('modal-edit-password').value = '';
 
             const tbody = document.getElementById('modal-recent-savings-body');
             tbody.innerHTML = '';
@@ -1930,7 +2215,9 @@ INDEX_TEMPLATE = """
             e.preventDefault();
             const payload = {
                 full_name: document.getElementById('modal-edit-fullname').value,
-                daily_target: document.getElementById('modal-edit-target').value
+                daily_target: document.getElementById('modal-edit-target').value,
+                username: document.getElementById('modal-edit-username').value.trim(),
+                password: document.getElementById('modal-edit-password').value.trim()
             };
 
             const res = await fetch(`/api/member/${currentModalMember.member_id}`, {
@@ -2212,7 +2499,7 @@ INDEX_TEMPLATE = """
         }
 
         window.onload = () => {
-            fetchAndRenderMembers();
+            checkAuthSession();
         };
     </script>
 </body>
