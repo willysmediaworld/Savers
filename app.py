@@ -894,7 +894,7 @@ INDEX_TEMPLATE = """
             border: 1.5px solid var(--border-light); font-size: 0.9rem; outline: none; background: #ffffff;
         }
         .search-results-dropdown {
-            position: absolute; top: 100%; left: 1rem; right: 1rem; background: #ffffff;
+            position: absolute; top: 100%; left: 0; right: 0; background: #ffffff;
             border: 1.5px solid var(--border-light); border-radius: 16px; box-shadow: 0 10px 25px rgba(0,0,0,0.1);
             z-index: 500; max-height: 240px; overflow-y: auto; display: none; margin-top: 4px;
         }
@@ -902,6 +902,7 @@ INDEX_TEMPLATE = """
             padding: 12px 16px; border-bottom: 1px solid var(--border-light); cursor: pointer;
             display: flex; justify-content: space-between; align-items: center; font-size: 0.88rem; font-weight: 600;
         }
+        .search-result-item:hover { background: #f8fafc; }
 
         .app-container { max-width: 600px; margin: 0 auto; width: 100%; padding: 0.5rem 1rem 2rem 1rem; flex: 1; }
 
@@ -1151,7 +1152,7 @@ INDEX_TEMPLATE = """
         </button>
     </header>
 
-    <!-- Search Container (Admin Only) -->
+    <!-- Search Container (Admin Only Header Search) -->
     <div class="search-container" id="admin-search-container">
         <div class="search-wrapper">
             <i class="fa-solid fa-magnifying-glass"></i>
@@ -1343,7 +1344,7 @@ INDEX_TEMPLATE = """
             <div id="members-cards-container"></div>
         </div>
 
-        <!-- VIEW 4: RECORD SAVINGS -->
+        <!-- VIEW 4: RECORD SAVINGS (SEARCH-BASED SELECTION) -->
         <div id="view-savings" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">➕ Record Savings</div>
@@ -1351,9 +1352,13 @@ INDEX_TEMPLATE = """
             </div>
             <div class="card-form">
                 <form id="form-add-savings" onsubmit="handleSavingsSubmit(event)">
-                    <div class="form-group">
-                        <label>Select Member</label>
-                        <select class="form-control member-select" id="savings-member" required></select>
+                    <div class="form-group" style="position: relative;">
+                        <label>Search & Select Member</label>
+                        <input type="text" class="form-control" id="savings-member-search" 
+                               placeholder="Type at least 2 digits or name (e.g. 01 or Sunday)..." 
+                               oninput="handleSavingsSearchInput(event)" autocomplete="off">
+                        <input type="hidden" id="savings-member-id" required>
+                        <div class="search-results-dropdown" id="savings-search-dropdown"></div>
                     </div>
                     <div class="form-group">
                         <label>Contribution Amount (₦)</label>
@@ -1607,7 +1612,7 @@ INDEX_TEMPLATE = """
             <div class="modal-nav-tabs">
                 <div class="modal-tab active" onclick="switchModalTab('overview')">Overview</div>
                 <div class="modal-tab" onclick="switchModalTab('save')">➕ Save</div>
-                <div class="modal-tab" onclick="switchModalTab('withdraw')">抓 Withdraw</div>
+                <div class="modal-tab" onclick="switchModalTab('withdraw')">🏧 Withdraw</div>
                 <div class="modal-tab" onclick="switchModalTab('loans')">💳 Issue Loan</div>
                 <div class="modal-tab" onclick="switchModalTab('manage')">⚙️ Edit / Credentials</div>
             </div>
@@ -2147,6 +2152,52 @@ INDEX_TEMPLATE = """
             openMemberModal(memberId);
         }
 
+        /* -------------------------------------------------------------------------
+           RECORD SAVINGS: MEMBER SEARCH FUNCTIONS
+        ------------------------------------------------------------------------- */
+        function handleSavingsSearchInput(e) {
+            const query = e.target.value.trim().toLowerCase();
+            const dropdown = document.getElementById('savings-search-dropdown');
+            document.getElementById('savings-member-id').value = ''; // clear selected ID when input changes
+            dropdown.innerHTML = '';
+
+            const digitsOnly = query.replace(/\D/g, '');
+
+            if (digitsOnly.length >= 2 || query.length >= 2) {
+                const matches = globalMembers.filter(m => 
+                    m.member_id.toLowerCase().includes(query) ||
+                    m.full_name.toLowerCase().includes(query) ||
+                    m.member_id.replace(/\D/g, '').includes(digitsOnly)
+                );
+
+                if (matches.length > 0) {
+                    dropdown.style.display = 'block';
+                    matches.forEach(m => {
+                        const safeName = m.full_name.replace(/'/g, "\\'");
+                        dropdown.innerHTML += `
+                            <div class="search-result-item" onclick="selectSavingsMember('${m.member_id}', '${safeName} (${m.member_id})')">
+                                <div>
+                                    <strong>${m.full_name}</strong> (${m.member_id})
+                                </div>
+                                <span style="color:var(--primary-green-dark);">${formatNaira(m.net_balance)}</span>
+                            </div>
+                        `;
+                    });
+                } else {
+                    dropdown.style.display = 'block';
+                    dropdown.innerHTML = '<div class="search-result-item" style="color:var(--text-muted);">No matching member found</div>';
+                }
+            } else {
+                dropdown.style.display = 'none';
+            }
+        }
+
+        function selectSavingsMember(memberId, displayName) {
+            document.getElementById('savings-member-search').value = displayName;
+            document.getElementById('savings-member-id').value = memberId;
+            document.getElementById('savings-search-dropdown').style.display = 'none';
+        }
+
         async function deleteMemberDirect(memberId) {
             const confirmed = await showCustomConfirm("Delete Member", `Are you sure you want to permanently delete member ${memberId}?`);
             if (confirmed) {
@@ -2323,8 +2374,14 @@ INDEX_TEMPLATE = """
 
         async function handleSavingsSubmit(e) {
             e.preventDefault();
+            const memberId = document.getElementById('savings-member-id').value;
+            if (!memberId) {
+                showToast("Please search and select a valid member first.", "error");
+                return;
+            }
+
             const payload = {
-                member_id: document.getElementById('savings-member').value,
+                member_id: memberId,
                 amount: document.getElementById('savings-amount').value,
                 date: document.getElementById('savings-date').value,
                 notes: document.getElementById('savings-notes').value
@@ -2340,6 +2397,8 @@ INDEX_TEMPLATE = """
             if (result.success) {
                 showToast(result.message);
                 document.getElementById('form-add-savings').reset();
+                document.getElementById('savings-member-id').value = '';
+                document.getElementById('savings-search-dropdown').style.display = 'none';
                 document.getElementById('savings-date').value = todayStr;
                 await fetchAndRenderMembers();
                 showSection('overview');
