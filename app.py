@@ -703,7 +703,7 @@ def update_password():
 
 
 # -----------------------------------------------------------------------------
-# FRONTEND TEMPLATE (REDESIGNED HOMEPAGE TO MATCH SKETCH)
+# FRONTEND TEMPLATE
 # -----------------------------------------------------------------------------
 INDEX_TEMPLATE = """
 <!DOCTYPE html>
@@ -752,7 +752,6 @@ INDEX_TEMPLATE = """
         .toast.error { background: var(--primary-red); }
         @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
 
-        /* Header matching Sketch */
         header {
             background: #ffffff; padding: 0.85rem 1.25rem;
             display: flex; justify-content: space-between; align-items: center;
@@ -772,7 +771,6 @@ INDEX_TEMPLATE = """
             cursor: pointer; display: flex; align-items: center; gap: 6px;
         }
 
-        /* Search Bar right below Header (as in sketch) */
         .search-container { padding: 0.85rem 1.25rem 0.5rem 1.25rem; max-width: 600px; margin: 0 auto; width: 100%; position: relative; }
         .search-wrapper { position: relative; width: 100%; }
         .search-wrapper i { position: absolute; left: 16px; top: 50%; transform: translateY(-50%); color: #94a3b8; font-size: 1rem; }
@@ -791,7 +789,6 @@ INDEX_TEMPLATE = """
         }
         .search-result-item:hover { background: #f1f5f9; }
 
-        /* Main Container */
         .app-container { max-width: 600px; margin: 0 auto; width: 100%; padding: 0.5rem 1.25rem 2rem 1.25rem; flex: 1; }
 
         .view-section { display: none; }
@@ -804,8 +801,13 @@ INDEX_TEMPLATE = """
             background: #e2e8f0; color: var(--text-dark); border: none;
             padding: 6px 14px; border-radius: 8px; font-weight: 700; font-size: 0.85rem; cursor: pointer;
         }
+        .btn-add-header {
+            background: var(--primary-green); color: #ffffff; border: none;
+            padding: 6px 14px; border-radius: 8px; font-weight: 700; font-size: 0.85rem; cursor: pointer;
+            display: flex; align-items: center; gap: 6px;
+        }
 
-        /* 3-COLUMN HOMEPAGE GRID MATCHING SKETCH EXACTLY */
+        /* 3-COLUMN HOMEPAGE GRID */
         .grid-3-col {
             display: grid;
             grid-template-columns: repeat(3, 1fr);
@@ -849,7 +851,6 @@ INDEX_TEMPLATE = """
             line-height: 1.15;
         }
 
-        /* Center Row 4 (Maintenance & Password) */
         .grid-row-4-center {
             display: flex;
             justify-content: center;
@@ -860,7 +861,6 @@ INDEX_TEMPLATE = """
             width: calc(33.333% - 8px);
         }
 
-        /* Wallet Overview Box */
         .overview-box {
             background: #f0fdf4; border: 1.5px solid #bbf7d0; border-radius: 16px;
             padding: 1.25rem 1.5rem; margin-bottom: 1.5rem; display: flex; flex-direction: column; gap: 12px;
@@ -1005,7 +1005,6 @@ INDEX_TEMPLATE = """
             border-radius: 8px; font-size: 0.75rem; font-weight: 700; cursor: pointer;
         }
 
-        /* Footer matching Sketch Exactly */
         footer {
             background: #ffffff; color: var(--text-dark); text-align: center;
             padding: 1.5rem 1rem; font-size: 0.9rem; font-weight: 700;
@@ -1017,7 +1016,6 @@ INDEX_TEMPLATE = """
 
     <div id="toast-container"></div>
 
-    <!-- Header matching Sketch -->
     <header>
         <div class="brand-box" onclick="showSection('home')">
             <div class="sprout-icon"><i class="fa-solid fa-leaf"></i></div>
@@ -1028,7 +1026,6 @@ INDEX_TEMPLATE = """
         </button>
     </header>
 
-    <!-- Global Search Bar below Header -->
     <div class="search-container">
         <div class="search-wrapper">
             <i class="fa-solid fa-magnifying-glass"></i>
@@ -1039,15 +1036,11 @@ INDEX_TEMPLATE = """
         <div class="search-results-dropdown" id="search-results-dropdown"></div>
     </div>
 
-    <!-- App Container -->
     <div class="app-container">
 
-        <!-- VIEW 1: REDESIGNED HOMEPAGE GRID MATCHING SKETCH -->
+        <!-- VIEW 1: HOMEPAGE GRID -->
         <div id="view-home" class="view-section active">
-            
-            <!-- Rows 1 - 3 (3 Cards Each) -->
             <div class="grid-3-col">
-                <!-- Row 1 -->
                 <div class="menu-card" onclick="showSection('overview')">
                     <div class="icon-badge pink">👛</div>
                     <div class="card-heading">Wallet Overview</div>
@@ -1063,7 +1056,6 @@ INDEX_TEMPLATE = """
                     <div class="card-heading">Process Withdraw</div>
                 </div>
 
-                <!-- Row 2 -->
                 <div class="menu-card" onclick="showSection('loans')">
                     <div class="icon-badge yellow">💳</div>
                     <div class="card-heading">Loans</div>
@@ -1079,7 +1071,6 @@ INDEX_TEMPLATE = """
                     <div class="card-heading">Monthly</div>
                 </div>
 
-                <!-- Row 3 -->
                 <div class="menu-card" onclick="showSection('members')">
                     <div class="icon-badge mint">👥</div>
                     <div class="card-heading">Member</div>
@@ -1096,7 +1087,6 @@ INDEX_TEMPLATE = """
                 </div>
             </div>
 
-            <!-- Row 4 (Centered 2 Cards: Maintenance & Password) -->
             <div class="grid-row-4-center">
                 <div class="menu-card" onclick="showSection('maintenance')">
                     <div class="icon-badge yellow">🛠️</div>
@@ -1108,7 +1098,6 @@ INDEX_TEMPLATE = """
                     <div class="card-heading">Password</div>
                 </div>
             </div>
-
         </div>
 
         <div id="view-overview" class="view-section">
@@ -1143,10 +1132,16 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
+        <!-- VIEW 3: MEMBERS DIRECTORY (WITH ADD MEMBER BUTTON BESIDE BACK BUTTON) -->
         <div id="view-members" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">👥 Members Directory</div>
-                <button class="btn-back" onclick="showSection('home')">← Back</button>
+                <div style="display: flex; gap: 8px; align-items: center;">
+                    <button class="btn-add-header" onclick="showSection('register')">
+                        <i class="fa-solid fa-user-plus"></i> Add Member
+                    </button>
+                    <button class="btn-back" onclick="showSection('home')">← Back</button>
+                </div>
             </div>
 
             <div class="filter-row">
@@ -1416,7 +1411,6 @@ INDEX_TEMPLATE = """
                 <div class="modal-tab" onclick="switchModalTab('manage')">⚙️ Edit / Delete</div>
             </div>
 
-            <!-- TAB 1: OVERVIEW (SHOWING LAST 5 SAVINGS) -->
             <div id="modal-panel-overview" class="modal-tab-panel active">
                 <div class="modal-details-list">
                     <div class="modal-detail-item">
@@ -1555,7 +1549,6 @@ INDEX_TEMPLATE = """
         </div>
     </div>
 
-    <!-- Footer matching Sketch Exactly -->
     <footer>
         Savers Growth System ©2026<br>
         Designed by Willys Media World - 09018363715
