@@ -18,7 +18,6 @@ def get_db():
         if DATABASE_URL:
             import psycopg2
             import psycopg2.extras
-            # Convert postgres:// to postgresql:// for SQLAlchemy/psycopg2 compatibility
             url = DATABASE_URL.replace("postgres://", "postgresql://")
             g.db = psycopg2.connect(url, cursor_factory=psycopg2.extras.DictCursor)
         else:
@@ -133,7 +132,6 @@ def init_db():
 
         db.commit()
 
-        # Seed initial admin account
         cursor.execute('SELECT COUNT(*) FROM admin_users')
         row = cursor.fetchone()
         count = row[0] if row else 0
@@ -145,7 +143,6 @@ def init_db():
                 cursor.execute('INSERT INTO admin_users (username, password_hash) VALUES (?, ?)', ('admin', default_hash))
             db.commit()
 
-# Initialize Database ONCE
 with app.app_context():
     init_db()
 
@@ -306,11 +303,12 @@ def member_detail_update_delete(member_id):
 
         member_id_actual = m['member_id']
 
+        # FETCH ONLY LAST 5 CONTRIBUTIONS
         cursor.execute(f'''
             SELECT id, amount, date, notes, is_service_fee, days_credited 
             FROM savings 
             WHERE member_id = {p} 
-            ORDER BY id DESC LIMIT 10
+            ORDER BY id DESC LIMIT 5
         ''', (member_id_actual,))
         savings = [dict(s) for s in cursor.fetchall()]
 
@@ -464,7 +462,7 @@ def delete_savings(savings_id):
     return jsonify({'success': True, 'message': 'Contribution deleted!'})
 
 # -----------------------------------------------------------------------------
-# WITHDRAWAL (NO PROCESSING FEES)
+# WITHDRAWAL
 # -----------------------------------------------------------------------------
 @app.route('/api/withdrawals', methods=['POST'])
 def process_withdrawal():
@@ -705,7 +703,7 @@ def update_password():
 
 
 # -----------------------------------------------------------------------------
-# FRONTEND TEMPLATE
+# FRONTEND TEMPLATE (REDESIGNED HOMEPAGE TO MATCH SKETCH)
 # -----------------------------------------------------------------------------
 INDEX_TEMPLATE = """
 <!DOCTYPE html>
@@ -726,13 +724,12 @@ INDEX_TEMPLATE = """
             --primary-green: #10b981;
             --primary-green-dark: #059669;
             --primary-red: #ef4444;
-            --primary-red-hover: #dc2626;
             --amber-fee: #d97706;
             --purple-cycle: #9333ea;
             --purple-bg: #fae8ff;
             --purple-border: #e9d5ff;
-            --border-light: #e2e8f0;
-            --radius-card: 20px;
+            --border-light: #cbd5e1;
+            --radius-card: 16px;
         }
 
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Plus Jakarta Sans', sans-serif; }
@@ -743,6 +740,7 @@ INDEX_TEMPLATE = """
             display: flex; flex-direction: column; min-height: 100vh;
         }
 
+        /* Toast Notifications */
         #toast-container { position: fixed; top: 20px; right: 20px; z-index: 9999; }
         .toast {
             background: #1e293b; color: #fff; padding: 12px 20px; border-radius: 12px;
@@ -754,31 +752,33 @@ INDEX_TEMPLATE = """
         .toast.error { background: var(--primary-red); }
         @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
 
+        /* Header matching Sketch */
         header {
-            background: #ffffff; padding: 1rem 1.25rem;
+            background: #ffffff; padding: 0.85rem 1.25rem;
             display: flex; justify-content: space-between; align-items: center;
-            border-bottom: 1px solid var(--border-light);
+            border-bottom: 1.5px solid var(--border-light);
             position: sticky; top: 0; z-index: 100;
         }
-        header .brand-box { display: flex; align-items: center; gap: 12px; cursor: pointer; }
+        header .brand-box { display: flex; align-items: center; gap: 10px; cursor: pointer; }
         header .sprout-icon {
             background: var(--primary-green); color: #ffffff;
-            width: 38px; height: 38px; border-radius: 50%;
-            display: flex; align-items: center; justify-content: center; font-size: 1.2rem;
+            width: 36px; height: 38px; border-radius: 50%;
+            display: flex; align-items: center; justify-content: center; font-size: 1.15rem;
         }
         header .brand-title { font-size: 1.35rem; font-weight: 800; color: var(--text-dark); letter-spacing: -0.3px; }
         header .btn-logout {
-            background: var(--primary-red); color: #ffffff; border: none;
-            padding: 8px 16px; border-radius: 10px; font-weight: 700; font-size: 0.9rem;
+            background: #ffffff; color: var(--text-dark); border: 1.5px solid var(--text-dark);
+            padding: 6px 14px; border-radius: 20px; font-weight: 700; font-size: 0.85rem;
             cursor: pointer; display: flex; align-items: center; gap: 6px;
         }
 
-        .search-container { padding: 1rem 1.25rem 0.5rem 1.25rem; max-width: 600px; margin: 0 auto; width: 100%; position: relative; }
+        /* Search Bar right below Header (as in sketch) */
+        .search-container { padding: 0.85rem 1.25rem 0.5rem 1.25rem; max-width: 600px; margin: 0 auto; width: 100%; position: relative; }
         .search-wrapper { position: relative; width: 100%; }
-        .search-wrapper i { position: absolute; left: 16px; top: 50%; transform: translateY(-50%); color: #94a3b8; font-size: 1.05rem; }
+        .search-wrapper i { position: absolute; left: 16px; top: 50%; transform: translateY(-50%); color: #94a3b8; font-size: 1rem; }
         .search-input {
-            width: 100%; padding: 12px 16px 12px 46px; border-radius: 30px;
-            border: 1.5px solid #cbd5e1; font-size: 0.95rem; outline: none; background: #ffffff;
+            width: 100%; padding: 10px 16px 10px 42px; border-radius: 30px;
+            border: 1.5px solid var(--border-light); font-size: 0.9rem; outline: none; background: #ffffff;
         }
         .search-results-dropdown {
             position: absolute; top: 100%; left: 1.25rem; right: 1.25rem; background: #ffffff;
@@ -791,30 +791,49 @@ INDEX_TEMPLATE = """
         }
         .search-result-item:hover { background: #f1f5f9; }
 
-        .app-container { max-width: 600px; margin: 0 auto; width: 100%; padding: 1rem 1.25rem 2rem 1.25rem; flex: 1; }
+        /* Main Container */
+        .app-container { max-width: 600px; margin: 0 auto; width: 100%; padding: 0.5rem 1.25rem 2rem 1.25rem; flex: 1; }
 
         .view-section { display: none; }
         .view-section.active { display: block; animation: fadeIn 0.25s forwards; }
         @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
 
         .view-header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.25rem; }
-        .view-title-group { display: flex; align-items: center; gap: 10px; font-size: 1.25rem; font-weight: 800; }
+        .view-title-group { display: flex; align-items: center; gap: 10px; font-size: 1.2rem; font-weight: 800; }
         .btn-back {
             background: #e2e8f0; color: var(--text-dark); border: none;
             padding: 6px 14px; border-radius: 8px; font-weight: 700; font-size: 0.85rem; cursor: pointer;
         }
 
-        .cards-stack { display: flex; flex-direction: column; gap: 1rem; }
+        /* 3-COLUMN HOMEPAGE GRID MATCHING SKETCH EXACTLY */
+        .grid-3-col {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 12px;
+            margin-top: 0.5rem;
+        }
+
         .menu-card {
-            background: var(--card-bg); border: 1.5px solid var(--border-light);
-            border-radius: var(--radius-card); padding: 1.5rem 1.25rem;
-            display: flex; flex-direction: column; align-items: center; text-align: center;
-            cursor: pointer; box-shadow: 0 2px 6px rgba(0,0,0,0.02); transition: all 0.2s;
+            background: var(--card-bg);
+            border: 1.5px solid var(--border-light);
+            border-radius: var(--radius-card);
+            padding: 1rem 0.4rem;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            cursor: pointer;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.02);
+            transition: all 0.2s;
+            min-height: 96px;
         }
         .menu-card:hover { border-color: var(--primary-green); transform: translateY(-2px); }
+        
         .menu-card .icon-badge {
-            width: 50px; height: 50px; border-radius: 16px;
-            display: flex; align-items: center; justify-content: center; font-size: 1.5rem; margin-bottom: 8px;
+            width: 38px; height: 38px; border-radius: 12px;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 1.2rem; margin-bottom: 6px;
         }
         .icon-badge.pink { background: #ffe4e6; }
         .icon-badge.mint { background: #d1fae5; }
@@ -823,9 +842,25 @@ INDEX_TEMPLATE = """
         .icon-badge.purple { background: #f3e8ff; }
         .icon-badge.teal { background: #ccfbf1; }
 
-        .menu-card .card-heading { font-size: 1.15rem; font-weight: 800; color: var(--text-dark); margin-bottom: 2px; }
-        .menu-card .card-sub { font-size: 0.85rem; color: var(--text-muted); font-weight: 500; }
+        .menu-card .card-heading {
+            font-size: 0.82rem;
+            font-weight: 800;
+            color: var(--text-dark);
+            line-height: 1.15;
+        }
 
+        /* Center Row 4 (Maintenance & Password) */
+        .grid-row-4-center {
+            display: flex;
+            justify-content: center;
+            gap: 12px;
+            margin-top: 12px;
+        }
+        .grid-row-4-center .menu-card {
+            width: calc(33.333% - 8px);
+        }
+
+        /* Wallet Overview Box */
         .overview-box {
             background: #f0fdf4; border: 1.5px solid #bbf7d0; border-radius: 16px;
             padding: 1.25rem 1.5rem; margin-bottom: 1.5rem; display: flex; flex-direction: column; gap: 12px;
@@ -970,10 +1005,11 @@ INDEX_TEMPLATE = """
             border-radius: 8px; font-size: 0.75rem; font-weight: 700; cursor: pointer;
         }
 
+        /* Footer matching Sketch Exactly */
         footer {
-            background: #ffffff; color: var(--text-muted); text-align: center;
-            padding: 1.25rem; font-size: 0.85rem; font-weight: 600;
-            border-top: 1px solid var(--border-light); margin-top: auto;
+            background: #ffffff; color: var(--text-dark); text-align: center;
+            padding: 1.5rem 1rem; font-size: 0.9rem; font-weight: 700;
+            border-top: 1.5px solid var(--border-light); margin-top: auto; line-height: 1.5;
         }
     </style>
 </head>
@@ -981,96 +1017,98 @@ INDEX_TEMPLATE = """
 
     <div id="toast-container"></div>
 
+    <!-- Header matching Sketch -->
     <header>
         <div class="brand-box" onclick="showSection('home')">
             <div class="sprout-icon"><i class="fa-solid fa-leaf"></i></div>
             <div class="brand-title">Savers Growth</div>
         </div>
         <button class="btn-logout" onclick="showToast('Logged out', 'success')">
-            <i class="fa-solid fa-door-open"></i> Logout
+            Logout
         </button>
     </header>
 
+    <!-- Global Search Bar below Header -->
     <div class="search-container">
         <div class="search-wrapper">
             <i class="fa-solid fa-magnifying-glass"></i>
             <input type="text" class="search-input" id="global-search-input" 
-                   placeholder="Type member ID or digits (e.g. 01, 0001)..." 
+                   placeholder="Type member ID or digits (e.g. 01)..." 
                    oninput="handleGlobalSearchInput(event)">
         </div>
         <div class="search-results-dropdown" id="search-results-dropdown"></div>
     </div>
 
+    <!-- App Container -->
     <div class="app-container">
 
+        <!-- VIEW 1: REDESIGNED HOMEPAGE GRID MATCHING SKETCH -->
         <div id="view-home" class="view-section active">
-            <div class="cards-stack">
+            
+            <!-- Rows 1 - 3 (3 Cards Each) -->
+            <div class="grid-3-col">
+                <!-- Row 1 -->
                 <div class="menu-card" onclick="showSection('overview')">
                     <div class="icon-badge pink">👛</div>
                     <div class="card-heading">Wallet Overview</div>
-                    <div class="card-sub">Balances & Service Fees</div>
                 </div>
 
                 <div class="menu-card" onclick="showSection('savings')">
                     <div class="icon-badge mint"><i class="fa-solid fa-plus" style="color:#059669;"></i></div>
                     <div class="card-heading">Record Savings</div>
-                    <div class="card-sub">Add Daily Contribution</div>
                 </div>
 
                 <div class="menu-card" onclick="showSection('withdrawal')">
                     <div class="icon-badge blue"><i class="fa-solid fa-cash-register" style="color:#2563eb;"></i></div>
-                    <div class="card-heading">Process Withdrawal</div>
-                    <div class="card-sub">Instant & Reset Payouts</div>
+                    <div class="card-heading">Process Withdraw</div>
                 </div>
 
+                <!-- Row 2 -->
                 <div class="menu-card" onclick="showSection('loans')">
                     <div class="icon-badge yellow">💳</div>
-                    <div class="card-heading">Loans Ledger</div>
-                    <div class="card-sub">0% Interest Member Loans</div>
+                    <div class="card-heading">Loans</div>
                 </div>
 
                 <div class="menu-card" onclick="showSection('tracker')">
                     <div class="icon-badge teal">📊</div>
-                    <div class="card-heading">Daily Tracker</div>
-                    <div class="card-sub">Inflows, Outflows & Totals</div>
+                    <div class="card-heading">Daily</div>
                 </div>
 
                 <div class="menu-card" onclick="showSection('service-fees')">
                     <div class="icon-badge purple">🏢</div>
-                    <div class="card-heading">Monthly Service Fees</div>
-                    <div class="card-sub">Fee Income Breakdown</div>
+                    <div class="card-heading">Monthly</div>
                 </div>
 
+                <!-- Row 3 -->
                 <div class="menu-card" onclick="showSection('members')">
                     <div class="icon-badge mint">👥</div>
-                    <div class="card-heading">Members Directory</div>
-                    <div class="card-sub">View Cycles & Balances</div>
+                    <div class="card-heading">Member</div>
                 </div>
 
                 <div class="menu-card" onclick="showSection('register')">
                     <div class="icon-badge blue">🆔</div>
-                    <div class="card-heading">Register Member</div>
-                    <div class="card-sub">Add System Member</div>
+                    <div class="card-heading">Register</div>
                 </div>
 
                 <div class="menu-card" onclick="showSection('manage-members')">
                     <div class="icon-badge pink">⚙️</div>
-                    <div class="card-heading">Manage Members</div>
-                    <div class="card-sub">Edit & Delete Members</div>
+                    <div class="card-heading">Manage</div>
                 </div>
+            </div>
 
+            <!-- Row 4 (Centered 2 Cards: Maintenance & Password) -->
+            <div class="grid-row-4-center">
                 <div class="menu-card" onclick="showSection('maintenance')">
                     <div class="icon-badge yellow">🛠️</div>
                     <div class="card-heading">Maintenance</div>
-                    <div class="card-sub">Ledger Resync & Reset</div>
                 </div>
 
                 <div class="menu-card" onclick="showSection('password')">
                     <div class="icon-badge purple">🔐</div>
                     <div class="card-heading">Password</div>
-                    <div class="card-sub">Update Admin Password</div>
                 </div>
             </div>
+
         </div>
 
         <div id="view-overview" class="view-section">
@@ -1362,6 +1400,7 @@ INDEX_TEMPLATE = """
 
     </div>
 
+    <!-- MEMBER PROFILE MODAL -->
     <div class="modal-overlay" id="member-profile-modal">
         <div class="modal-card">
             <div class="modal-header">
@@ -1377,6 +1416,7 @@ INDEX_TEMPLATE = """
                 <div class="modal-tab" onclick="switchModalTab('manage')">⚙️ Edit / Delete</div>
             </div>
 
+            <!-- TAB 1: OVERVIEW (SHOWING LAST 5 SAVINGS) -->
             <div id="modal-panel-overview" class="modal-tab-panel active">
                 <div class="modal-details-list">
                     <div class="modal-detail-item">
@@ -1398,7 +1438,7 @@ INDEX_TEMPLATE = """
                     <div class="val" id="modal-cycle-val">🔄 Cycle 1 (0 / 31 days)</div>
                 </div>
 
-                <div style="font-size: 0.95rem; font-weight: 800; margin-bottom: 8px;">Recent Contributions</div>
+                <div style="font-size: 0.95rem; font-weight: 800; margin-bottom: 8px;">Recent Contributions (Last 5)</div>
                 <div class="table-responsive">
                     <table>
                         <thead>
@@ -1515,9 +1555,10 @@ INDEX_TEMPLATE = """
         </div>
     </div>
 
+    <!-- Footer matching Sketch Exactly -->
     <footer>
-        Savers Growth System © 2026<br>
-        <span style="font-size: 0.75rem; color: #94a3b8;">Designed by Willys Media World - 09018363715</span>
+        Savers Growth System ©2026<br>
+        Designed by Willys Media World - 09018363715
     </footer>
 
     <script>
