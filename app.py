@@ -446,7 +446,7 @@ def reset_single_member_ledger(member_id):
     return jsonify({'success': True, 'message': f'Financial data for {m["full_name"]} ({actual_id}) reset successfully!'})
 
 # -----------------------------------------------------------------------------
-# SAVINGS LOGIC
+# BULK SAVINGS & MULTI-CYCLE FEE LOGIC
 # -----------------------------------------------------------------------------
 @app.route('/api/savings', methods=['GET', 'POST'])
 def handle_savings():
@@ -483,28 +483,28 @@ def handle_savings():
         total_fees_collected = 0.0
         total_savings_credited = 0.0
         total_days_added = 0
+        fee_records = []
 
+        # CALCULATE MULTI-CYCLE SPAN & EXTRACT SERVICE FEES
         while remaining_cash > 0:
+            # 1. Pull out cycle service fee if at start of cycle (cycle_days == 0)
             if cycle_days == 0:
                 fee_deducted = min(daily_target, remaining_cash)
                 remaining_cash -= fee_deducted
                 total_fees_collected += fee_deducted
 
-                cursor.execute(f'''
-                    INSERT INTO savings (member_id, amount, date, month_year, is_service_fee, days_credited, notes)
-                    VALUES ({p}, {p}, {p}, {p}, 1, 0, {p})
-                ''', (member_id, fee_deducted, savings_date, month_year, f'Cycle {current_cycle} Service Fee'))
-
-                cursor.execute(f'''
-                    INSERT INTO service_fees (member_id, amount, month_year, description, date)
-                    VALUES ({p}, {p}, {p}, {p}, {p})
-                ''', (member_id, fee_deducted, month_year, f'Cycle {current_cycle} First Save Fee', savings_date))
+                fee_records.append({
+                    'amount': fee_deducted,
+                    'cycle': current_cycle,
+                    'desc': f'Cycle {current_cycle} Service Fee'
+                })
 
                 if remaining_cash <= 0:
                     break
 
-            days_needed_in_current_cycle = 31 - cycle_days
-            max_cash_needed = days_needed_in_current_cycle * daily_target
+            # 2. Compute days credited for current cycle
+            days_needed = 31 - cycle_days
+            max_cash_needed = days_needed * daily_target
 
             cash_for_this_cycle = min(remaining_cash, max_cash_needed)
             days_bought = int(cash_for_this_cycle / daily_target)
@@ -516,23 +516,42 @@ def handle_savings():
                 total_days_added += days_bought
                 cycle_days += days_bought
 
-                cursor.execute(f'''
-                    INSERT INTO savings (member_id, amount, date, month_year, is_service_fee, days_credited, notes)
-                    VALUES ({p}, {p}, {p}, {p}, 0, {p}, {p})
-                ''', (member_id, cash_spent, savings_date, month_year, days_bought, notes or f'Contribution ({days_bought} days)'))
+            if days_bought == 0 and remaining_cash < daily_target and cycle_days > 0:
+                break
 
+            # Advance to next cycle if cycle complete
             if cycle_days >= 31:
                 current_cycle += 1
                 cycle_days = 0
-            else:
-                break
+
+        # INSERT EXTRACTED SERVICE FEE RECORDS
+        for f in fee_records:
+            cursor.execute(f'''
+                INSERT INTO savings (member_id, amount, date, month_year, is_service_fee, days_credited, notes)
+                VALUES ({p}, {p}, {p}, {p}, 1, 0, {p})
+            ''', (member_id, f['amount'], savings_date, month_year, f['desc']))
+
+            cursor.execute(f'''
+                INSERT INTO service_fees (member_id, amount, month_year, description, date)
+                VALUES ({p}, {p}, {p}, {p}, {p})
+            ''', (member_id, f['amount'], month_year, f['desc'], savings_date))
+
+        # INSERT ONE SINGLE BULK SAVINGS RECORD FOR NET SAVINGS
+        if total_savings_credited > 0:
+            savings_note = notes or f'Bulk Contribution ({total_days_added} days)'
+            cursor.execute(f'''
+                INSERT INTO savings (member_id, amount, date, month_year, is_service_fee, days_credited, notes)
+                VALUES ({p}, {p}, {p}, {p}, 0, {p}, {p})
+            ''', (member_id, total_savings_credited, savings_date, month_year, total_days_added, savings_note))
 
         cursor.execute(f'UPDATE members SET current_cycle = {p}, cycle_days = {p} WHERE member_id = {p}', 
                        (current_cycle, cycle_days, member_id))
         db.commit()
 
         msg = f"Processed ₦{deposit_amount:,.2f} for {full_name}! "
-        msg += f"₦{total_fees_collected:,.2f} deducted in service fees, ₦{total_savings_credited:,.2f} added to savings ({total_days_added} days). "
+        if total_fees_collected > 0:
+            msg += f"₦{total_fees_collected:,.2f} extracted in service fees. "
+        msg += f"₦{total_savings_credited:,.2f} saved in bulk ({total_days_added} days credited). "
         msg += f"Status: Cycle {current_cycle} ({cycle_days} / 31 days)."
 
         return jsonify({'success': True, 'message': msg})
@@ -2158,7 +2177,7 @@ INDEX_TEMPLATE = """
         function handleSavingsSearchInput(e) {
             const query = e.target.value.trim().toLowerCase();
             const dropdown = document.getElementById('savings-search-dropdown');
-            document.getElementById('savings-member-id').value = ''; // clear selected ID when input changes
+            document.getElementById('savings-member-id').value = ''; 
             dropdown.innerHTML = '';
 
             const digitsOnly = query.replace(/\D/g, '');
