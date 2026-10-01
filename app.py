@@ -11,15 +11,17 @@ app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'savers_growth_31day_cycle_key_2026_secured')
 
 # -----------------------------------------------------------------------------
-# HELPER: ACCURATE MONTH-ADDITION FOR BULK SERVICE FEE SPREADING
+# HELPER: ACCURATE MONTH-ADDITION FOR BULK SERVICE FEE SPREADING (ANCHORED TO 1st OF MONTH)
 # -----------------------------------------------------------------------------
 def add_months(sourcedate, months):
+    """
+    Calculates consecutive month offsets, strictly anchoring the resulting date
+    to the 1st of that month (YYYY-MM-01).
+    """
     month = sourcedate.month - 1 + months
     year = sourcedate.year + month // 12
     month = month % 12 + 1
-    max_days = [31, 29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0) else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    day = min(sourcedate.day, max_days[month - 1])
-    return date(year, month, day)
+    return date(year, month, 1)
 
 # -----------------------------------------------------------------------------
 # DATABASE SETUP & SPEED INDEXING
@@ -528,7 +530,7 @@ def reset_single_member_ledger(member_id):
     return jsonify({'success': True, 'message': f'Financial data for {m["full_name"]} ({actual_id}) reset successfully!'})
 
 # -----------------------------------------------------------------------------
-# BULK SAVINGS & MULTI-MONTH SERVICE FEE SPREADING (FIXED MULTI-MONTH ALGORITHM)
+# BULK SAVINGS & MULTI-MONTH SERVICE FEE SPREADING (UPDATED 1st OF MONTH RULE)
 # -----------------------------------------------------------------------------
 @app.route('/api/savings', methods=['GET', 'POST'])
 def handle_savings():
@@ -560,7 +562,10 @@ def handle_savings():
         cycle_days = m['cycle_days']
         daily_target = m['daily_target'] if m['daily_target'] > 0 else 500.0
 
-        base_date = datetime.strptime(savings_date_str, '%Y-%m-%d').date()
+        # Parse payment date and FORCE baseline start to the 1st of that month
+        raw_date = datetime.strptime(savings_date_str, '%Y-%m-%d').date()
+        base_date = raw_date.replace(day=1) # Snapped strictly to 1st of month
+        
         start_cycle = current_cycle
 
         remaining_cash = deposit_amount
@@ -569,17 +574,17 @@ def handle_savings():
         total_days_added = 0
         fee_records = []
 
-        # ACCURATELY SPREAD SERVICE FEES ACROSS CONSECUTIVE CALENDAR MONTHS
+        # SPREAD SERVICE FEES ACROSS CONSECUTIVE CALENDAR MONTHS (ALWAYS 1st OF MONTH)
         while remaining_cash > 0:
             if cycle_days == 0:
                 fee_deducted = min(daily_target, remaining_cash)
                 remaining_cash -= fee_deducted
                 total_fees_collected += fee_deducted
 
-                # Calculate target date by advancing 1 month per cycle
+                # Calculate target fee date (Always 1st of the target month)
                 month_offset = current_cycle - start_cycle
                 target_fee_date = add_months(base_date, month_offset)
-                fee_date_fmt = target_fee_date.strftime('%Y-%m-%d')
+                fee_date_fmt = target_fee_date.strftime('%Y-%m-01')
                 fee_month_fmt = target_fee_date.strftime('%Y-%m')
 
                 fee_records.append({
@@ -587,7 +592,7 @@ def handle_savings():
                     'cycle': current_cycle,
                     'date': fee_date_fmt,
                     'month_year': fee_month_fmt,
-                    'desc': f'Cycle {current_cycle} Service Fee'
+                    'desc': f'Cycle {current_cycle} Service Fee ({fee_month_fmt})'
                 })
 
                 if remaining_cash <= 0:
@@ -613,7 +618,7 @@ def handle_savings():
                 current_cycle += 1
                 cycle_days = 0
 
-        # INSERT EXTRACTED SERVICE FEES DATED BY CONSECUTIVE MONTHS
+        # INSERT EXTRACTED SERVICE FEES DATED BY CONSECUTIVE MONTHS (1st OF EACH MONTH)
         for f in fee_records:
             cursor.execute(f'''
                 INSERT INTO savings (member_id, amount, date, month_year, is_service_fee, days_credited, notes)
@@ -629,7 +634,7 @@ def handle_savings():
 
         if total_savings_credited > 0:
             savings_note = notes or f'Bulk Contribution ({total_days_added} days)'
-            month_year_base = base_date.strftime('%Y-%m')
+            month_year_base = raw_date.strftime('%Y-%m')
             cursor.execute(f'''
                 INSERT INTO savings (member_id, amount, date, month_year, is_service_fee, days_credited, notes)
                 VALUES ({p}, {p}, {p}, {p}, 0, {p}, {p})
@@ -1023,9 +1028,15 @@ def update_password():
     else:
         return jsonify({'success': False, 'message': 'Incorrect current password.'}), 400
 
+# -----------------------------------------------------------------------------
+# FRONTEND ENTRY POINT
+# -----------------------------------------------------------------------------
+@app.route('/')
+def index():
+    return render_template_string(INDEX_TEMPLATE)
 
 # -----------------------------------------------------------------------------
-# FRONTEND TEMPLATE
+# HTML/CSS/JS SINGLE PAGE INTERFACE
 # -----------------------------------------------------------------------------
 INDEX_TEMPLATE = """
 <!DOCTYPE html>
@@ -1033,7 +1044,7 @@ INDEX_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Savers Growth</title>
+    <title>Savers Growth System</title>
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     
@@ -1060,10 +1071,9 @@ INDEX_TEMPLATE = """
             background-color: var(--bg-body);
             color: var(--text-dark);
             display: flex; flex-direction: column; min-height: 100vh;
-            padding-top: 112px; /* Prevent page content from hiding under fixed sticky header */
+            padding-top: 112px;
         }
 
-        /* Toast Notifications */
         #toast-container { position: fixed; top: 16px; right: 16px; z-index: 9999; }
         .toast {
             background: #1e293b; color: #fff; padding: 12px 18px; border-radius: 12px;
@@ -1075,22 +1085,13 @@ INDEX_TEMPLATE = """
         .toast.error { background: var(--primary-red); }
         @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
 
-        /* FIXED NON-SCROLLABLE STICKY TOP WRAPPER */
         .sticky-header-container {
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            z-index: 1000;
-            background: #ffffff;
-            border-bottom: 1.5px solid var(--border-light);
+            position: fixed; top: 0; left: 0; right: 0; z-index: 1000;
+            background: #ffffff; border-bottom: 1.5px solid var(--border-light);
             box-shadow: 0 2px 10px rgba(0,0,0,0.04);
         }
 
-        header {
-            padding: 0.75rem 1rem 0.25rem 1rem;
-            display: flex; justify-content: space-between; align-items: center;
-        }
+        header { padding: 0.75rem 1rem 0.25rem 1rem; display: flex; justify-space-between; align-items: center; }
         header .brand-box { display: flex; align-items: center; gap: 10px; cursor: pointer; }
         header .sprout-icon {
             background: var(--primary-green); color: #ffffff;
@@ -1112,32 +1113,15 @@ INDEX_TEMPLATE = """
             cursor: pointer; min-height: 36px;
         }
 
-        /* SEARCH BAR & FIXED STICKY BACK BUTTON ROW */
         .sticky-nav-bar {
-            padding: 0.25rem 1rem 0.6rem 1rem;
-            max-width: 600px;
-            margin: 0 auto;
-            width: 100%;
-            position: relative;
-            display: flex;
-            align-items: center;
-            gap: 8px;
+            padding: 0.25rem 1rem 0.6rem 1rem; max-width: 600px; margin: 0 auto;
+            width: 100%; position: relative; display: flex; align-items: center; gap: 8px;
         }
 
         .btn-back-sticky {
-            background: #0f172a;
-            color: #ffffff;
-            border: none;
-            padding: 9px 14px;
-            border-radius: 20px;
-            font-weight: 800;
-            font-size: 0.82rem;
-            cursor: pointer;
-            display: none; /* Auto-shown on sub-pages */
-            align-items: center;
-            gap: 6px;
-            white-space: nowrap;
-            flex-shrink: 0;
+            background: #0f172a; color: #ffffff; border: none; padding: 9px 14px;
+            border-radius: 20px; font-weight: 800; font-size: 0.82rem; cursor: pointer;
+            display: none; align-items: center; gap: 6px; white-space: nowrap; flex-shrink: 0;
             box-shadow: 0 2px 6px rgba(0,0,0,0.12);
         }
         .btn-back-sticky:active { transform: scale(0.96); }
@@ -1186,33 +1170,16 @@ INDEX_TEMPLATE = """
         }
         .login-header h2 { font-size: 1.35rem; font-weight: 800; color: var(--text-dark); }
 
-        .grid-3-col {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 10px;
-            margin-top: 0.4rem;
-        }
-
+        .grid-3-col { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 0.4rem; }
         .menu-card {
-            background: var(--card-bg);
-            border: 1.5px solid var(--border-light);
-            border-radius: var(--radius-card);
-            padding: 0.85rem 0.3rem;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            text-align: center;
-            cursor: pointer;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.02);
-            transition: all 0.15s;
-            min-height: 92px;
+            background: var(--card-bg); border: 1.5px solid var(--border-light);
+            border-radius: var(--radius-card); padding: 0.85rem 0.3rem; display: flex;
+            flex-direction: column; align-items: center; justify-content: center; text-align: center;
+            cursor: pointer; box-shadow: 0 2px 4px rgba(0,0,0,0.02); transition: all 0.15s; min-height: 92px;
         }
         .menu-card:active { transform: scale(0.97); }
-        
         .menu-card .icon-badge {
-            width: 36px; height: 36px; border-radius: 10px;
-            display: flex; align-items: center; justify-content: center;
+            width: 36px; height: 36px; border-radius: 10px; display: flex; align-items: center; justify-content: center;
             font-size: 1.1rem; margin-bottom: 4px;
         }
         .icon-badge.pink { background: #ffe4e6; }
@@ -1222,23 +1189,10 @@ INDEX_TEMPLATE = """
         .icon-badge.purple { background: #f3e8ff; }
         .icon-badge.teal { background: #ccfbf1; }
 
-        .menu-card .card-heading {
-            font-size: 0.8rem;
-            font-weight: 800;
-            color: var(--text-dark);
-            line-height: 1.15;
-        }
+        .menu-card .card-heading { font-size: 0.8rem; font-weight: 800; color: var(--text-dark); line-height: 1.15; }
 
-        .grid-row-4-center {
-            display: flex;
-            justify-content: center;
-            gap: 10px;
-            margin-top: 10px;
-            flex-wrap: wrap;
-        }
-        .grid-row-4-center .menu-card {
-            width: calc(33.333% - 7px);
-        }
+        .grid-row-4-center { display: flex; justify-content: center; gap: 10px; margin-top: 10px; flex-wrap: wrap; }
+        .grid-row-4-center .menu-card { width: calc(33.333% - 7px); }
 
         .overview-box {
             background: #f0fdf4; border: 1.5px solid #bbf7d0; border-radius: 16px;
@@ -1265,12 +1219,7 @@ INDEX_TEMPLATE = """
         .filter-row { display: flex; gap: 8px; margin-bottom: 1rem; }
         .filter-row input, .filter-row select { flex: 1; padding: 10px 14px; border-radius: 12px; border: 1.5px solid var(--border-light); font-size: 0.88rem; background: #fff; }
 
-        .member-grid-2col {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 10px;
-        }
-
+        .member-grid-2col { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
         .member-card-item {
             background: #ffffff; border: 1.5px solid var(--border-light);
             border-radius: 14px; padding: 0.75rem; cursor: pointer;
@@ -1286,8 +1235,7 @@ INDEX_TEMPLATE = """
 
         .member-stats-box {
             background: #f8fafc; border-radius: 8px; padding: 6px 8px;
-            display: flex; flex-direction: column; gap: 2px;
-            font-size: 0.75rem; margin-bottom: 6px;
+            display: flex; flex-direction: column; gap: 2px; font-size: 0.75rem; margin-bottom: 6px;
         }
         .stat-line { font-weight: 600; color: var(--text-dark); display: flex; justify-content: space-between; }
         .stat-line .val-green { color: var(--primary-green-dark); font-weight: 800; }
@@ -1298,47 +1246,6 @@ INDEX_TEMPLATE = """
             padding: 5px; border-radius: 8px; text-align: center; font-weight: 700; font-size: 0.72rem;
             display: flex; align-items: center; justify-content: center; gap: 4px;
         }
-
-        .modal-overlay {
-            position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-            background: rgba(15, 23, 42, 0.6); backdrop-filter: blur(3px);
-            z-index: 2000; display: none; align-items: center; justify-content: center; padding: 0.85rem;
-        }
-        .modal-overlay.active { display: flex; }
-        .modal-card {
-            background: #ffffff; border-radius: 20px; width: 100%; max-width: 480px;
-            max-height: 90vh; overflow-y: auto; padding: 1.25rem; box-shadow: 0 20px 25px -5px rgba(0,0,0,0.1);
-            animation: modalUp 0.2s forwards;
-        }
-        @keyframes modalUp { from { transform: translateY(15px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
-
-        .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.85rem; }
-        .modal-title { font-size: 1.1rem; font-weight: 800; color: var(--text-dark); }
-        .modal-close { background: none; border: none; font-size: 1.5rem; color: var(--text-muted); cursor: pointer; }
-
-        .modal-nav-tabs {
-            display: flex; gap: 6px; overflow-x: auto; padding-bottom: 6px; margin-bottom: 1rem;
-            border-bottom: 1px solid var(--border-light);
-        }
-        .modal-tab {
-            padding: 6px 12px; border-radius: 16px; font-size: 0.8rem; font-weight: 700;
-            border: 1px solid var(--border-light); cursor: pointer; white-space: nowrap; color: var(--text-muted);
-            background: #ffffff;
-        }
-        .modal-tab.active { background: #f0fdf4; border-color: #bbf7d0; color: var(--primary-green-dark); }
-
-        .modal-tab-panel { display: none; }
-        .modal-tab-panel.active { display: block; }
-
-        .modal-details-list { display: flex; flex-direction: column; gap: 8px; font-size: 0.9rem; margin-bottom: 1rem; }
-        .modal-detail-item { display: flex; justify-content: space-between; font-weight: 600; }
-
-        .modal-cycle-box {
-            background: var(--purple-bg); border: 1.5px solid var(--purple-border); border-radius: 12px;
-            padding: 10px 14px; margin-bottom: 1rem;
-        }
-        .modal-cycle-box .lbl { font-size: 0.72rem; font-weight: 800; color: var(--purple-cycle); text-transform: uppercase; margin-bottom: 2px; }
-        .modal-cycle-box .val { font-weight: 800; color: var(--purple-cycle); font-size: 0.95rem; }
 
         .card-form { background: #fff; border: 1.5px solid var(--border-light); border-radius: 16px; padding: 1.1rem; }
         .form-group { display: flex; flex-direction: column; gap: 5px; margin-bottom: 0.85rem; }
@@ -1352,14 +1259,6 @@ INDEX_TEMPLATE = """
             border-radius: 10px; font-weight: 700; font-size: 0.9rem; cursor: pointer; width: 100%; min-height: 46px;
         }
 
-        .manage-subcard {
-            background: #f8fafc; border: 1.5px solid var(--border-light);
-            border-radius: 12px; padding: 0.85rem; margin-bottom: 0.85rem;
-        }
-        .manage-subcard-title {
-            font-size: 0.88rem; font-weight: 800; margin-bottom: 0.6rem; display: flex; align-items: center; gap: 6px;
-        }
-
         .table-responsive { overflow-x: auto; border-radius: 12px; border: 1.5px solid var(--border-light); }
         table { width: 100%; border-collapse: collapse; text-align: left; font-size: 0.82rem; }
         th, td { padding: 9px 10px; border-bottom: 1px solid var(--border-light); }
@@ -1370,20 +1269,6 @@ INDEX_TEMPLATE = """
         .badge-fee { background: #fef3c7; color: #92400e; }
         .badge-payout { background: #fee2e2; color: #991b1b; }
         .badge-success { background: #d1fae5; color: #065f46; }
-        .badge-warning { background: #fef3c7; color: #92400e; }
-
-        .btn-delete-sm {
-            background: var(--primary-red); color: white; border: none; padding: 5px 10px;
-            border-radius: 6px; font-size: 0.72rem; font-weight: 700; cursor: pointer;
-        }
-        .btn-edit-sm {
-            background: #2563eb; color: white; border: none; padding: 5px 10px;
-            border-radius: 6px; font-size: 0.72rem; font-weight: 700; cursor: pointer; margin-right: 2px;
-        }
-        .btn-repay-sm {
-            background: var(--primary-green-dark); color: white; border: none; padding: 5px 10px;
-            border-radius: 6px; font-size: 0.72rem; font-weight: 700; cursor: pointer;
-        }
 
         footer {
             background: #ffffff; color: var(--text-dark); text-align: center;
@@ -1396,10 +1281,10 @@ INDEX_TEMPLATE = """
 
     <div id="toast-container"></div>
 
-    <!-- FIXED STICKY TOP CONTAINER (HEADER, BACK BUTTON, AND SEARCH BAR FIXED AT TOP) -->
+    <!-- FIXED STICKY TOP CONTAINER -->
     <div class="sticky-header-container">
         <header>
-            <div class="brand-box" onclick="handleHeaderClick()">
+            <div class="brand-box" onclick="goBackHome()">
                 <div class="sprout-icon"><i class="fa-solid fa-leaf"></i></div>
                 <div class="brand-title">Savers Growth</div>
             </div>
@@ -1407,13 +1292,10 @@ INDEX_TEMPLATE = """
                 <div class="member-count-badge" id="header-member-badge">
                     <i class="fa-solid fa-users"></i> <span id="header-member-count">0</span>
                 </div>
-                <button class="btn-logout" id="header-auth-btn" onclick="handleAuthAction()">
-                    Logout
-                </button>
+                <button class="btn-logout" id="header-auth-btn" onclick="handleAuthAction()">Logout</button>
             </div>
         </header>
 
-        <!-- SEARCH BAR & FIXED STICKY BACK BUTTON ROW -->
         <div class="sticky-nav-bar" id="admin-search-container">
             <button class="btn-back-sticky" id="global-back-btn" onclick="goBackHome()">
                 <i class="fa-solid fa-arrow-left"></i> Back
@@ -1422,7 +1304,7 @@ INDEX_TEMPLATE = """
             <div class="search-wrapper">
                 <i class="fa-solid fa-magnifying-glass"></i>
                 <input type="text" class="search-input" id="global-search-input" 
-                       placeholder="Type member ID or digits (e.g. 01)..." 
+                       placeholder="Type member ID or name..." 
                        oninput="handleGlobalSearchInput(event)">
             </div>
             <div class="search-results-dropdown" id="search-results-dropdown"></div>
@@ -1527,7 +1409,7 @@ INDEX_TEMPLATE = """
 
         <!-- VIEW 1B: MEMBER PRIVATE PORTAL -->
         <div id="view-member-portal" class="view-section">
-            <div style="background: #ffffff; border: 1.5px solid var(--border-light); border-radius: 20px; padding: 1.25rem; margin-bottom: 1rem;">
+            <div style="background: #ffffff; border: 1.5px solid var(--border-light); border-radius: 20px; padding: 1.25rem;">
                 <div style="font-size: 1.2rem; font-weight: 800; color: var(--text-dark);" id="mportal-name">Welcome Member</div>
                 <div style="font-size: 0.85rem; color: var(--text-muted);" id="mportal-id">ID: SVR0000</div>
 
@@ -1551,12 +1433,7 @@ INDEX_TEMPLATE = """
                     </div>
                 </div>
 
-                <div class="modal-cycle-box" style="margin-bottom: 1rem;">
-                    <div class="lbl">YOUR CYCLE STATUS:</div>
-                    <div class="val" id="mportal-cycle">🔄 Cycle 1 (0 / 31 days)</div>
-                </div>
-
-                <div style="font-size: 0.95rem; font-weight: 800; margin-bottom: 8px;">My Recent Savings (Last 5)</div>
+                <div style="font-size: 0.95rem; font-weight: 800; margin-bottom: 8px;">My Recent Savings</div>
                 <div class="table-responsive">
                     <table>
                         <thead>
@@ -1572,778 +1449,137 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 2: WALLET OVERVIEW -->
+        <!-- VIEW 2: OVERVIEW -->
         <div id="view-overview" class="view-section">
-            <div class="view-header-row">
-                <div class="view-title-group">👛 Wallet Overview</div>
-            </div>
-
+            <div class="view-header-row"><div class="view-title-group">👛 Wallet Overview</div></div>
             <div class="overview-box">
-                <div class="overview-row">
-                    <span>Total Money Saved:</span>
-                    <span class="amount-saved" id="stat-total-saved">₦0.00</span>
-                </div>
-                <div class="overview-row">
-                    <span>Total Service Fees Deducted:</span>
-                    <span class="amount-fees" id="stat-service-fees">₦0.00</span>
-                </div>
+                <div class="overview-row"><span>Total Money Saved:</span><span class="amount-saved" id="stat-total-saved">₦0.00</span></div>
+                <div class="overview-row"><span>Total Service Fees Deducted:</span><span class="amount-fees" id="stat-service-fees">₦0.00</span></div>
                 <div class="overview-divider"></div>
-                <div class="overview-row">
-                    <span>Net Wallet Balance:</span>
-                    <span class="amount-net" id="stat-net-balance">₦0.00</span>
-                </div>
-            </div>
-
-            <div class="action-stack">
-                <button class="btn-action-primary" onclick="showSection('withdrawal')">
-                    <i class="fa-solid fa-cash-register"></i> Proceed to Withdrawal
-                </button>
-                <button class="btn-action-secondary" onclick="showSection('savings')">
-                    <i class="fa-solid fa-plus"></i> Record Contribution
-                </button>
+                <div class="overview-row"><span>Net Wallet Balance:</span><span class="amount-net" id="stat-net-balance">₦0.00</span></div>
             </div>
         </div>
 
-        <!-- VIEW 3: MEMBERS DIRECTORY -->
-        <div id="view-members" class="view-section">
-            <div class="view-header-row">
-                <div class="view-title-group">👥 Members Directory</div>
-                <button class="btn-add-header" onclick="showSection('register')">
-                    <i class="fa-solid fa-user-plus"></i> Add Member
-                </button>
-            </div>
-
-            <div class="filter-row">
-                <input type="text" id="member-search-dir" placeholder="Search name or ID..." onkeyup="renderMembersDirectory()">
-            </div>
-
-            <div id="members-cards-container" class="member-grid-2col"></div>
-
-            <div style="margin-top: 1.25rem;">
-                <button class="btn-submit" onclick="showSection('register')" style="display: flex; align-items: center; justify-content: center; gap: 8px;">
-                    <i class="fa-solid fa-user-plus"></i> Add New Member
-                </button>
-            </div>
-        </div>
-
-        <!-- VIEW 4: RECORD SAVINGS -->
+        <!-- VIEW 3: SAVINGS FORM -->
         <div id="view-savings" class="view-section">
-            <div class="view-header-row">
-                <div class="view-title-group">➕ Record Savings</div>
-            </div>
+            <div class="view-header-row"><div class="view-title-group">➕ Record Contribution</div></div>
             <div class="card-form">
-                <form id="form-add-savings" onsubmit="handleSavingsSubmit(event)">
-                    <div class="form-group" style="position: relative;">
-                        <label>Search & Select Member</label>
-                        <input type="text" class="form-control" id="savings-member-search" 
-                               placeholder="Type at least 2 digits or name (e.g. 01 or Sunday)..." 
-                               oninput="handleSavingsSearchInput(event)" autocomplete="off">
-                        <input type="hidden" id="savings-member-id" required>
-                        <div class="search-results-dropdown" id="savings-search-dropdown"></div>
+                <form onsubmit="handleSavingsSubmit(event)">
+                    <div class="form-group">
+                        <label>Select Member</label>
+                        <select class="form-control" id="savings-member-select" required></select>
                     </div>
                     <div class="form-group">
-                        <label>Contribution Amount (₦)</label>
-                        <input type="number" step="0.01" class="form-control" id="savings-amount" placeholder="e.g. 5000" required>
+                        <label>Deposit Amount (₦)</label>
+                        <input type="number" class="form-control" id="savings-amount" placeholder="e.g. 5000" required>
                     </div>
                     <div class="form-group">
-                        <label>Date</label>
+                        <label>Deposit Date</label>
                         <input type="date" class="form-control" id="savings-date" required>
                     </div>
                     <div class="form-group">
-                        <label>Notes</label>
-                        <input type="text" class="form-control" id="savings-notes" placeholder="Optional details">
+                        <label>Notes (Optional)</label>
+                        <input type="text" class="form-control" id="savings-notes" placeholder="e.g. Cash payment">
                     </div>
-                    <button type="submit" class="btn-submit">Record Contribution</button>
+                    <button type="submit" class="btn-submit">Record Deposit</button>
                 </form>
             </div>
         </div>
 
-        <!-- VIEW 5: PROCESS WITHDRAWAL -->
+        <!-- VIEW 4: WITHDRAWAL FORM -->
         <div id="view-withdrawal" class="view-section">
-            <div class="view-header-row">
-                <div class="view-title-group">🏧 Process Withdrawal</div>
-            </div>
+            <div class="view-header-row"><div class="view-title-group">💸 Process Withdrawal</div></div>
             <div class="card-form">
-                <form id="form-withdrawal" onsubmit="handleWithdrawalSubmit(event)">
-                    <div class="form-group" style="position: relative;">
-                        <label>Search & Select Member</label>
-                        <input type="text" class="form-control" id="withdrawal-member-search" 
-                               placeholder="Type at least 2 digits or name (e.g. 01 or Sunday)..." 
-                               oninput="handleWithdrawalSearchInput(event)" autocomplete="off" required>
-                        <input type="hidden" id="withdrawal-member-id" required>
-                        <div class="search-results-dropdown" id="withdrawal-search-dropdown"></div>
+                <form onsubmit="handleWithdrawalSubmit(event)">
+                    <div class="form-group">
+                        <label>Select Member</label>
+                        <select class="form-control" id="withdraw-member-select" required></select>
                     </div>
                     <div class="form-group">
                         <label>Withdrawal Amount (₦)</label>
-                        <input type="number" step="0.01" class="form-control" id="withdrawal-amount" placeholder="e.g. 5000" required>
+                        <input type="number" class="form-control" id="withdraw-amount" placeholder="e.g. 10000" required>
                     </div>
                     <div class="form-group">
-                        <label>Withdrawal Type</label>
-                        <select class="form-control" id="withdrawal-type">
-                            <option value="instant">Instant Partial Payout</option>
-                            <option value="reset">Full Cycle Reset Payout</option>
-                        </select>
+                        <label>Withdrawal Date</label>
+                        <input type="date" class="form-control" id="withdraw-date" required>
                     </div>
-                    <div class="form-group">
-                        <label>Date</label>
-                        <input type="date" class="form-control" id="withdrawal-date" required>
-                    </div>
-                    <button type="submit" class="btn-submit" style="background:var(--primary-red);">Execute Withdrawal</button>
+                    <button type="submit" class="btn-submit" style="background: var(--primary-red);">Process Withdrawal</button>
                 </form>
             </div>
         </div>
 
-        <!-- VIEW 6: LOANS LEDGER -->
-        <div id="view-loans" class="view-section">
-            <div class="view-header-row">
-                <div class="view-title-group">💳 Loans Ledger</div>
-            </div>
-
-            <div class="table-responsive">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Member</th>
-                            <th>Principal</th>
-                            <th>Repayable</th>
-                            <th>Paid</th>
-                            <th>Balance</th>
-                            <th>Status</th>
-                            <th>Action</th>
-                        </tr>
-                    </thead>
-                    <tbody id="loans-table-body"></tbody>
-                </table>
-            </div>
+        <!-- VIEW 5: MEMBERS DIRECTORY -->
+        <div id="view-members" class="view-section">
+            <div class="view-header-row"><div class="view-title-group">👥 Members Directory</div></div>
+            <div id="members-cards-container" class="member-grid-2col"></div>
         </div>
 
-        <!-- VIEW 7: DAILY TRACKER -->
-        <div id="view-tracker" class="view-section">
-            <div class="view-header-row">
-                <div class="view-title-group">📊 Daily Tracker</div>
-            </div>
-
-            <div class="filter-row">
-                <input type="date" id="tracker-date-filter" onchange="loadTracker()">
-                <button class="btn-add-header" style="background:#64748b;" onclick="clearTrackerDateFilter()">Show All Days</button>
-            </div>
-
-            <div class="overview-box" style="margin-bottom: 1.25rem;">
-                <div class="overview-row">
-                    <span>Total Gross Inflows:</span>
-                    <span class="amount-saved" id="tracker-summary-inflow">₦0.00</span>
-                </div>
-                <div class="overview-row">
-                    <span>Total Service Fees:</span>
-                    <span class="amount-fees" id="tracker-summary-fees">₦0.00</span>
-                </div>
-                <div class="overview-row">
-                    <span>Total Outflows:</span>
-                    <span style="color:var(--primary-red); font-weight:800;" id="tracker-summary-outflow">₦0.00</span>
-                </div>
-                <div class="overview-divider"></div>
-                <div class="overview-row">
-                    <span>Net Daily Cashflow:</span>
-                    <span class="amount-net" id="tracker-summary-net">₦0.00</span>
-                </div>
-            </div>
-
-            <div class="table-responsive">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Date</th>
-                            <th>Member</th>
-                            <th>Gross Inflow (₦)</th>
-                            <th>Service Fee (₦)</th>
-                            <th>Outflow (₦)</th>
-                            <th>Type & Notes</th>
-                        </tr>
-                    </thead>
-                    <tbody id="tracker-table-body"></tbody>
-                </table>
-            </div>
-        </div>
-
-        <!-- VIEW 8: MONTHLY SERVICE FEES -->
-        <div id="view-service-fees" class="view-section">
-            <div class="view-header-row">
-                <div class="view-title-group">🏢 Monthly Service Fees</div>
-            </div>
-
-            <div class="filter-row">
-                <input type="month" id="fees-month-filter" onchange="loadServiceFees()">
-                <button class="btn-add-header" style="background:#64748b;" onclick="clearFeesMonthFilter()">Show All Months</button>
-            </div>
-
-            <div class="overview-box" style="margin-bottom: 1.25rem;">
-                <div class="overview-row">
-                    <span>Total Service Fees Income:</span>
-                    <span class="amount-fees" id="fees-summary-total">₦0.00</span>
-                </div>
-            </div>
-
-            <div class="table-responsive">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Member</th>
-                            <th>Amount (₦)</th>
-                            <th>Month</th>
-                            <th>Date</th>
-                            <th>Description</th>
-                        </tr>
-                    </thead>
-                    <tbody id="fees-table-body"></tbody>
-                </table>
-            </div>
-        </div>
-
-        <!-- VIEW 9: REGISTER MEMBER -->
+        <!-- VIEW 6: REGISTER MEMBER -->
         <div id="view-register" class="view-section">
-            <div class="view-header-row">
-                <div class="view-title-group">🆔 Register Member</div>
-            </div>
+            <div class="view-header-row"><div class="view-title-group">🆔 Register New Member</div></div>
             <div class="card-form">
-                <form id="form-register-member" onsubmit="handleMemberRegister(event)">
+                <form onsubmit="handleRegisterSubmit(event)">
                     <div class="form-group">
                         <label>Full Name</label>
-                        <input type="text" class="form-control" id="reg-fullname" placeholder="e.g. Sunday Adebayo" required>
+                        <input type="text" class="form-control" id="reg-fullname" placeholder="John Doe" required>
                     </div>
                     <div class="form-group">
-                        <label>Daily Target Amount (₦) <span style="font-weight:400; color:var(--text-muted);">(Optional - Default: ₦500)</span></label>
-                        <input type="number" step="0.01" class="form-control" id="reg-target" placeholder="e.g. 1000">
+                        <label>Daily Target Amount (₦)</label>
+                        <input type="number" class="form-control" id="reg-target" placeholder="500" value="500">
                     </div>
                     <button type="submit" class="btn-submit">Register Member</button>
                 </form>
             </div>
         </div>
 
-        <!-- VIEW 10: MANAGE MEMBERS -->
-        <div id="view-manage-members" class="view-section">
-            <div class="view-header-row">
-                <div class="view-title-group">⚙️ Manage Members</div>
-            </div>
-
-            <div class="overview-box" style="margin-bottom: 1.25rem; background: #e0f2fe; border-color: #bae6fd;">
-                <div class="overview-row">
-                    <span style="color: #0369a1; font-weight:800;">Total System Daily Target Sum:</span>
-                    <span style="font-size:1.2rem; font-weight:800; color:#0284c7;" id="manage-total-daily-target">₦0.00</span>
-                </div>
-            </div>
-
-            <div class="table-responsive">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Member ID</th>
-                            <th>Full Name</th>
-                            <th>Target</th>
-                            <th>Actions</th>
-                        </tr>
-                    </thead>
-                    <tbody id="manage-members-table-body"></tbody>
-                </table>
-            </div>
-        </div>
-
-        <!-- MEMBER CONTRIBUTION HISTORY VIEW -->
-        <div id="view-member-history" class="view-section">
-            <div class="view-header-row">
-                <div class="view-title-group">🔎 Member Contribution History</div>
-            </div>
-
-            <div class="card-form" style="margin-bottom: 1.25rem;">
-                <div class="form-group" style="position: relative; margin-bottom: 0;">
-                    <label>Search Member to View Full History</label>
-                    <input type="text" class="form-control" id="history-member-search" 
-                           placeholder="Type at least 2 digits or name..." 
-                           oninput="handleHistorySearchInput(event)" autocomplete="off">
-                    <div class="search-results-dropdown" id="history-search-dropdown"></div>
-                </div>
-            </div>
-
-            <div id="history-results-container" style="display:none;">
-                <div class="overview-box" style="margin-bottom: 1rem;">
-                    <div class="overview-row">
-                        <span id="history-member-name" style="font-weight:800; font-size:1.05rem;">-</span>
-                        <span id="history-member-target" style="font-size:0.88rem; color:var(--text-muted);">-</span>
-                    </div>
-                </div>
-
-                <div class="table-responsive">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Category</th>
-                                <th>Amount (₦)</th>
-                                <th>Date</th>
-                                <th>Days</th>
-                                <th>Notes</th>
-                            </tr>
-                        </thead>
-                        <tbody id="history-table-body"></tbody>
-                    </table>
-                </div>
-            </div>
-        </div>
-
-        <!-- PAST RECORDS ARCHIVE VIEW -->
-        <div id="view-past-records" class="view-section">
-            <div class="view-header-row">
-                <div class="view-title-group">📦 Past Records Archive</div>
-            </div>
-
-            <p style="font-size:0.85rem; color:var(--text-muted); margin-bottom:1rem;">
-                Permanent, un-deletable audit trail of all historical member savings, fees, withdrawals, and loans across all past cycles.
-            </p>
-
-            <div class="filter-row">
-                <input type="text" id="archive-search-input" placeholder="Search member name or ID..." onkeyup="filterArchiveRecords()">
-            </div>
-
-            <div class="table-responsive">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Member</th>
-                            <th>Category</th>
-                            <th>Amount (₦)</th>
-                            <th>Cycle</th>
-                            <th>Date</th>
-                            <th>Notes</th>
-                        </tr>
-                    </thead>
-                    <tbody id="archive-table-body"></tbody>
-                </table>
-            </div>
-        </div>
-
-        <!-- VIEW 11: MAINTENANCE -->
-        <div id="view-maintenance" class="view-section">
-            <div class="view-header-row">
-                <div class="view-title-group">🛠️ System Maintenance</div>
-            </div>
-
-            <div class="manage-subcard" style="margin-bottom: 1.25rem;">
-                <div class="manage-subcard-title" style="color:var(--primary-green-dark);">
-                    <i class="fa-solid fa-arrows-rotate"></i> 🔄 Rebuild Financial Sync
-                </div>
-                <p style="font-size:0.85rem; color:var(--text-muted); margin-bottom:1rem;">
-                    Audits loan statuses and recalculates system vault balances.
-                </p>
-                <button class="btn-submit" onclick="resyncLedger()">
-                    🔄 Execute Financial Sync
-                </button>
-            </div>
-
-            <div class="manage-subcard" style="border-color:#fca5a5; background:#fff5f5;">
-                <div class="manage-subcard-title" style="color:var(--primary-red);">
-                    <i class="fa-solid fa-triangle-exclamation"></i> ⚠️ Reset Active Financial Ledgers
-                </div>
-                <p style="font-size:0.85rem; color:var(--text-muted); margin-bottom:1rem;">
-                    Clears current active ledger tables. Members and past audit archive records remain fully preserved.
-                </p>
-                <button class="btn-submit" style="background:var(--primary-red);" onclick="triggerResetAllSystemLedgers()">
-                    ⚠️ Reset Active Ledgers
-                </button>
-            </div>
-        </div>
-
-        <!-- VIEW 12: PASSWORD -->
-        <div id="view-password" class="view-section">
-            <div class="view-header-row">
-                <div class="view-title-group">🔐 Update Password</div>
-            </div>
-            <div class="card-form">
-                <form id="form-password" onsubmit="handlePasswordUpdate(event)">
-                    <div class="form-group">
-                        <label>Current Password</label>
-                        <input type="password" class="form-control" id="pass-old" required>
-                    </div>
-                    <div class="form-group">
-                        <label>New Password</label>
-                        <input type="password" class="form-control" id="pass-new" required>
-                    </div>
-                    <button type="submit" class="btn-submit">Update Admin Password</button>
-                </form>
-            </div>
-        </div>
-
-    </div>
-
-    <!-- MEMBER PROFILE MODAL -->
-    <div class="modal-overlay" id="member-profile-modal">
-        <div class="modal-card">
-            <div class="modal-header">
-                <div class="modal-title" id="modal-member-name-title">Member Details</div>
-                <button class="modal-close" onclick="closeMemberModal()">×</button>
-            </div>
-
-            <div class="modal-nav-tabs">
-                <div class="modal-tab active" onclick="switchModalTab('overview')">Overview</div>
-                <div class="modal-tab" onclick="switchModalTab('save')">➕ Save</div>
-                <div class="modal-tab" onclick="switchModalTab('withdraw')">Role</div>
-                <div class="modal-tab" onclick="switchModalTab('loans')">💳 Issue Loan</div>
-                <div class="modal-tab" onclick="switchModalTab('manage')">⚙️ Edit / Credentials</div>
-            </div>
-
-            <div id="modal-panel-overview" class="modal-tab-panel active">
-                <div class="modal-details-list">
-                    <div class="modal-detail-item">
-                        <span style="color:var(--text-muted);">Daily Target:</span>
-                        <span id="modal-target">₦0.00</span>
-                    </div>
-                    <div class="modal-detail-item">
-                        <span style="color:var(--text-muted);">Savings Balance:</span>
-                        <span style="color:var(--primary-green-dark); font-weight:800;" id="modal-balance">₦0.00</span>
-                    </div>
-                    <div class="modal-detail-item">
-                        <span style="color:var(--text-muted);">Total Service Fees Paid:</span>
-                        <span style="color:var(--amber-fee); font-weight:800;" id="modal-service-fees">₦0.00</span>
-                    </div>
-                    <div class="modal-detail-item">
-                        <span style="color:var(--text-muted);">Active Loan:</span>
-                        <span style="color:var(--primary-red); font-weight:800;" id="modal-loan">₦0.00</span>
-                    </div>
-                </div>
-
-                <div class="modal-cycle-box">
-                    <div class="lbl">CYCLE STATUS:</div>
-                    <div class="val" id="modal-cycle-val">🔄 Cycle 1 (0 / 31 days)</div>
-                </div>
-
-                <div style="font-size: 0.95rem; font-weight: 800; margin-bottom: 8px;">Recent Contributions (Last 5)</div>
-                <div class="table-responsive">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>DATE</th>
-                                <th>GROSS</th>
-                                <th>DAYS</th>
-                                <th>ACTION</th>
-                            </tr>
-                        </thead>
-                        <tbody id="modal-recent-savings-body"></tbody>
-                    </table>
-                </div>
-            </div>
-
-            <div id="modal-panel-save" class="modal-tab-panel">
-                <form onsubmit="handleModalSave(event)">
-                    <div class="form-group">
-                        <label>Contribution Amount (₦)</label>
-                        <input type="number" step="0.01" class="form-control" id="modal-save-amount" placeholder="e.g. 5000" required>
-                    </div>
-                    <div class="form-group">
-                        <label>Date</label>
-                        <input type="date" class="form-control" id="modal-save-date" required>
-                    </div>
-                    <button type="submit" class="btn-submit">Record Contribution</button>
-                </form>
-            </div>
-
-            <div id="modal-panel-withdraw" class="modal-tab-panel">
-                <form onsubmit="handleModalWithdraw(event)">
-                    <div class="form-group">
-                        <label>Amount (₦)</label>
-                        <input type="number" step="0.01" class="form-control" id="modal-withdraw-amount" placeholder="e.g. 2000" required>
-                    </div>
-                    <div class="form-group">
-                        <label>Type</label>
-                        <select class="form-control" id="modal-withdraw-type">
-                            <option value="instant">Instant Partial Payout</option>
-                            <option value="reset">Full Cycle Reset Payout</option>
-                        </select>
-                    </div>
-                    <button type="submit" class="btn-submit" style="background:var(--primary-red);">Process Payout</button>
-                </form>
-            </div>
-
-            <div id="modal-panel-loans" class="modal-tab-panel">
-                <form onsubmit="handleModalLoan(event)">
-                    <div class="form-group">
-                        <label>Loan Amount (₦)</label>
-                        <input type="number" step="0.01" class="form-control" id="modal-loan-amount" placeholder="e.g. 10000" required>
-                    </div>
-                    <button type="submit" class="btn-submit">Issue Loan (0% Interest)</button>
-                </form>
-            </div>
-
-            <div id="modal-panel-manage" class="modal-tab-panel">
-                <div class="manage-subcard">
-                    <div class="manage-subcard-title" style="color:var(--primary-green-dark);">
-                        <i class="fa-solid fa-pen-to-square"></i> ✏️ Edit Profile & Login Credentials
-                    </div>
-                    <form onsubmit="handleModalUpdateMember(event)">
-                        <div class="form-group">
-                            <label>Full Name</label>
-                            <input type="text" class="form-control" id="modal-edit-fullname" required>
-                        </div>
-                        <div class="form-group">
-                            <label>Daily Target Amount (₦)</label>
-                            <input type="number" step="0.01" class="form-control" id="modal-edit-target" required>
-                        </div>
-                        <div class="form-group">
-                            <label>Member Username</label>
-                            <input type="text" class="form-control" id="modal-edit-username" placeholder="e.g. sunday123">
-                        </div>
-                        <div class="form-group">
-                            <label>New Password (Leave blank to keep unchanged)</label>
-                            <input type="password" class="form-control" id="modal-edit-password" placeholder="Enter new password">
-                        </div>
-                        <button type="submit" class="btn-submit">Save Changes & Credentials</button>
-                    </form>
-                </div>
-
-                <div class="manage-subcard" style="border-color:#fde68a; background:#fffbeb;">
-                    <div class="manage-subcard-title" style="color:var(--amber-fee);">
-                        <i class="fa-solid fa-rotate-left"></i> 🧹 Reset Member Financial Data
-                    </div>
-                    <p style="font-size:0.8rem; color:var(--text-muted); margin-bottom:0.75rem;">
-                        Clears all active savings, withdrawals, and loan logs for this member. Cycle resets to Cycle 1 (0 days). Member profile remains intact and all history is preserved in Past Records.
-                    </p>
-                    <button class="btn-submit" style="background:var(--amber-fee);" onclick="triggerResetMemberLedger()">
-                        Reset Member Financial Data
-                    </button>
-                </div>
-
-                <div class="manage-subcard" style="border-color:#fca5a5; background:#fff5f5;">
-                    <div class="manage-subcard-title" style="color:var(--primary-red);">
-                        <i class="fa-solid fa-trash"></i> 🗑️ Delete Member
-                    </div>
-                    <p style="font-size:0.8rem; color:var(--text-muted); margin-bottom:0.75rem;">
-                        Permanently deletes member profile and all active transactions.
-                    </p>
-                    <button class="btn-submit" style="background:var(--primary-red);" onclick="triggerDeleteMemberCurrent()">
-                        Delete Member Account
-                    </button>
-                </div>
-            </div>
-
-        </div>
-    </div>
-
-    <div class="modal-overlay" id="custom-confirm-modal">
-        <div class="modal-card" style="max-width:400px; text-align:center;">
-            <div style="font-size:2.5rem; color:var(--amber-fee); margin-bottom:10px;"><i class="fa-solid fa-triangle-exclamation"></i></div>
-            <div class="modal-title" id="confirm-modal-title" style="margin-bottom:8px;">Are you sure?</div>
-            <p id="confirm-modal-msg" style="font-size:0.9rem; color:var(--text-muted); margin-bottom:1.25rem;"></p>
-            <div style="display:flex; gap:10px;">
-                <button class="btn-add-header" style="flex:1; padding:12px; background:#e2e8f0; color:#0f172a; justify-content:center;" onclick="resolveConfirmModal(false)">Cancel</button>
-                <button class="btn-submit" id="confirm-modal-btn" style="flex:1; background:var(--primary-red);" onclick="resolveConfirmModal(true)">Confirm</button>
-            </div>
-        </div>
-    </div>
-
-    <div class="modal-overlay" id="custom-prompt-modal">
-        <div class="modal-card" style="max-width:400px;">
-            <div class="modal-title" id="prompt-modal-title" style="margin-bottom:10px;">Repay Loan</div>
-            <div class="form-group">
-                <label id="prompt-modal-label">Enter Repayment Amount (₦)</label>
-                <input type="number" step="0.01" class="form-control" id="prompt-modal-input" placeholder="e.g. 2000">
-            </div>
-            <div style="display:flex; gap:10px; margin-top:1rem;">
-                <button class="btn-add-header" style="flex:1; padding:12px; background:#e2e8f0; color:#0f172a; justify-content:center;" onclick="resolvePromptModal(null)">Cancel</button>
-                <button class="btn-submit" style="flex:1;" onclick="submitPromptModal()">Submit</button>
-            </div>
-        </div>
     </div>
 
     <footer>
-        Savers Growth System ©2026<br>
-        Designed by Willys Media World - 09018363715
+        Savers Growth System &copy; 2026<br>
+        <span style="font-size:0.75rem; color:var(--text-muted);">Cycle Baseline: 1st of every month</span>
     </footer>
 
     <script>
-        const todayStr = new Date().toISOString().split('T')[0];
-        const currentMonthStr = todayStr.substring(0, 7);
-
-        document.getElementById('savings-date').value = todayStr;
-        document.getElementById('withdrawal-date').value = todayStr;
-        document.getElementById('modal-save-date').value = todayStr;
-        document.getElementById('tracker-date-filter').value = todayStr;
-        document.getElementById('fees-month-filter').value = currentMonthStr;
-
-        let globalMembers = [];
-        let globalArchiveLogs = [];
-        let currentModalMember = null;
         let currentUser = null;
-        let confirmResolver = null;
-        let promptResolver = null;
+        let membersList = [];
 
-        function showCustomConfirm(title, message, btnText = "Confirm") {
-            return new Promise((resolve) => {
-                document.getElementById('confirm-modal-title').innerText = title;
-                document.getElementById('confirm-modal-msg').innerText = message;
-                document.getElementById('confirm-modal-btn').innerText = btnText;
-                document.getElementById('custom-confirm-modal').classList.add('active');
-                confirmResolver = resolve;
-            });
-        }
-
-        function resolveConfirmModal(val) {
-            document.getElementById('custom-confirm-modal').classList.remove('active');
-            if (confirmResolver) confirmResolver(val);
-        }
-
-        function showCustomPrompt(title, labelText) {
-            return new Promise((resolve) => {
-                document.getElementById('prompt-modal-title').innerText = title;
-                document.getElementById('prompt-modal-label').innerText = labelText;
-                document.getElementById('prompt-modal-input').value = '';
-                document.getElementById('custom-prompt-modal').classList.add('active');
-                promptResolver = resolve;
-            });
-        }
-
-        function submitPromptModal() {
-            const val = document.getElementById('prompt-modal-input').value;
-            document.getElementById('custom-prompt-modal').classList.remove('active');
-            if (promptResolver) promptResolver(val);
-        }
-
-        function resolvePromptModal(val) {
-            document.getElementById('custom-prompt-modal').classList.remove('active');
-            if (promptResolver) promptResolver(val);
-        }
-
-        function showToast(message, type = 'success') {
+        function showToast(msg, type = 'success') {
             const container = document.getElementById('toast-container');
             const toast = document.createElement('div');
             toast.className = `toast ${type}`;
-            toast.innerHTML = `<i class="fa-solid fa-${type === 'success' ? 'circle-check' : 'circle-exclamation'}"></i> ${message}`;
+            toast.innerHTML = `<i class="fa-solid fa-${type === 'success' ? 'circle-check' : 'circle-exclamation'}"></i> ${msg}`;
             container.appendChild(toast);
-            setTimeout(() => toast.remove(), 4000);
+            setTimeout(() => toast.remove(), 3500);
         }
 
-        function formatNaira(val) {
-            return '₦' + parseFloat(val || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-        }
-
-        async function checkAuthSession() {
+        async function initApp() {
+            document.getElementById('savings-date').value = new Date().toISOString().split('T')[0];
+            document.getElementById('withdraw-date').value = new Date().toISOString().split('T')[0];
+            
             try {
                 const res = await fetch('/api/auth/me');
                 const data = await res.json();
-
                 if (data.logged_in) {
                     currentUser = data;
-                    document.getElementById('header-auth-btn').innerText = 'Logout';
                     document.getElementById('header-member-count').innerText = data.total_members || 0;
-                    
                     if (data.role === 'admin') {
-                        document.getElementById('admin-search-container').style.display = 'flex';
-                        document.getElementById('header-member-badge').style.display = 'flex';
-                        fetchAndRenderMembers();
                         showSection('home');
                     } else {
-                        document.getElementById('admin-search-container').style.display = 'none';
-                        document.getElementById('header-member-badge').style.display = 'none';
-                        loadMemberPrivatePortal(data.member_id);
+                        showSection('member-portal');
+                        loadMemberPortal(data.member_id);
                     }
                 } else {
-                    currentUser = null;
-                    document.getElementById('header-auth-btn').innerText = 'Login';
-                    document.getElementById('admin-search-container').style.display = 'none';
-                    document.getElementById('header-member-badge').style.display = 'none';
                     showSection('login');
                 }
-            } catch (err) {
+            } catch (e) {
                 showSection('login');
             }
         }
 
-        async function handleLoginSubmit(e) {
-            e.preventDefault();
-            const username = document.getElementById('login-username').value.trim();
-            const password = document.getElementById('login-password').value.trim();
-
-            const res = await fetch('/api/auth/login', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ username, password })
-            });
-            const result = await res.json();
-
-            if (result.success) {
-                showToast(`Welcome back, ${result.name}!`);
-                document.getElementById('login-username').value = '';
-                document.getElementById('login-password').value = '';
-                checkAuthSession();
-            } else {
-                showToast(result.message, 'error');
-            }
-        }
-
-        async function handleAuthAction() {
-            if (currentUser) {
-                await fetch('/api/auth/logout', { method: 'POST' });
-                currentUser = null;
-                showToast('Logged out');
-                checkAuthSession();
-            } else {
-                showSection('login');
-            }
-        }
-
-        function handleHeaderClick() {
-            if (currentUser) {
-                if (currentUser.role === 'admin') showSection('home');
-                else loadMemberPrivatePortal(currentUser.member_id);
-            } else {
-                showSection('login');
-            }
-        }
-
-        function goBackHome() {
-            if (currentUser && currentUser.role === 'admin') {
-                showSection('home');
-            }
-        }
-
-        async function loadMemberPrivatePortal(memberId) {
-            const res = await fetch(`/api/member/${memberId}`);
-            const data = await res.json();
-
-            if (data.success) {
-                const m = data.member;
-                document.getElementById('mportal-name').innerText = m.full_name;
-                document.getElementById('mportal-id').innerText = `ID: ${m.member_id}`;
-                document.getElementById('mportal-balance').innerText = formatNaira(m.net_balance);
-                document.getElementById('mportal-target').innerText = formatNaira(m.daily_target);
-                document.getElementById('mportal-fees').innerText = formatNaira(m.total_service_fees);
-                document.getElementById('mportal-loan').innerText = formatNaira(m.active_loan);
-                document.getElementById('mportal-cycle').innerText = `🔄 Cycle ${m.current_cycle} (${m.cycle_days} / 31 days)`;
-
-                const tbody = document.getElementById('mportal-savings-table');
-                tbody.innerHTML = '';
-
-                if (data.recent_savings.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="3" style="text-align:center; color:var(--text-muted);">No savings recorded yet.</td></tr>';
-                } else {
-                    data.recent_savings.forEach(s => {
-                        tbody.innerHTML += `
-                            <tr>
-                                <td>${s.date}</td>
-                                <td style="color:var(--primary-green-dark); font-weight:800;">${formatNaira(s.amount)}</td>
-                                <td>${s.days_credited}</td>
-                            </tr>
-                        `;
-                    });
-                }
-
-                showSection('member-portal');
-            }
-        }
-
-        /* TOGGLE VISIBILITY OF STICKY TOP BACK BUTTON BASED ON CURRENT SECTION */
         function showSection(sectionId) {
-            document.querySelectorAll('.view-section').forEach(sec => sec.classList.remove('active'));
+            document.querySelectorAll('.view-section').forEach(el => el.classList.remove('active'));
             const target = document.getElementById(`view-${sectionId}`);
-            if (target) {
-                target.classList.add('active');
-                window.scrollTo({ top: 0, behavior: 'smooth' });
-            }
+            if (target) target.classList.add('active');
 
             const backBtn = document.getElementById('global-back-btn');
             if (sectionId === 'home' || sectionId === 'login' || sectionId === 'member-portal') {
@@ -2352,851 +1588,177 @@ INDEX_TEMPLATE = """
                 backBtn.style.display = 'inline-flex';
             }
 
-            if (sectionId === 'overview') loadOverview();
-            if (sectionId === 'members') fetchAndRenderMembers();
-            if (sectionId === 'manage-members') renderManageMembersTable();
-            if (sectionId === 'loans') loadLoans();
-            if (sectionId === 'tracker') loadTracker();
-            if (sectionId === 'service-fees') loadServiceFees();
-            if (sectionId === 'past-records') loadPastRecords();
+            if (['savings', 'withdrawal', 'members'].includes(sectionId)) {
+                loadMembers();
+            }
+            if (sectionId === 'overview') loadOverviewStats();
         }
 
-        async function fetchAndRenderMembers() {
-            try {
-                const res = await fetch('/api/members');
-                globalMembers = await res.json();
-
-                document.getElementById('header-member-count').innerText = globalMembers.length;
-
-                renderMembersDirectory();
-            } catch (err) {
-                console.error("Failed loading members:", err);
+        function goBackHome() {
+            if (currentUser && currentUser.role === 'admin') {
+                showSection('home');
+            } else if (currentUser) {
+                showSection('member-portal');
+            } else {
+                showSection('login');
             }
         }
 
-        function renderMembersDirectory() {
-            const container = document.getElementById('members-cards-container');
-            const searchVal = document.getElementById('member-search-dir').value.toLowerCase();
-            container.innerHTML = '';
+        async function handleLoginSubmit(e) {
+            e.preventDefault();
+            const u = document.getElementById('login-username').value;
+            const p = document.getElementById('login-password').value;
 
-            const filtered = globalMembers.filter(m => 
-                m.full_name.toLowerCase().includes(searchVal) || 
-                m.member_id.toLowerCase().includes(searchVal)
-            );
-
-            if (filtered.length === 0) {
-                container.innerHTML = '<div style="grid-column: 1 / -1; text-align:center; padding:2rem; color:var(--text-muted);">No members found. Add your first member!</div>';
-                return;
+            const res = await fetch('/api/auth/login', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({username: u, password: p})
+            });
+            const data = await res.json();
+            if (data.success) {
+                showToast('Login successful!');
+                initApp();
+            } else {
+                showToast(data.message, 'error');
             }
+        }
 
-            filtered.forEach(m => {
-                const initial = m.full_name.charAt(0).toUpperCase();
-                container.innerHTML += `
-                    <div class="member-card-item" onclick="openMemberModal('${m.member_id}')">
+        async function handleAuthAction() {
+            await fetch('/api/auth/logout', {method: 'POST'});
+            currentUser = null;
+            showSection('login');
+        }
+
+        async function loadMembers() {
+            const res = await fetch('/api/members');
+            membersList = await res.json();
+
+            const selects = ['savings-member-select', 'withdraw-member-select'];
+            selects.forEach(id => {
+                const el = document.getElementById(id);
+                if (el) {
+                    el.innerHTML = '<option value="">-- Select Member --</option>' +
+                        membersList.map(m => `<option value="${m.member_id}">${m.full_name} (${m.member_id})</option>`).join('');
+                }
+            });
+
+            const grid = document.getElementById('members-cards-container');
+            if (grid) {
+                grid.innerHTML = membersList.map(m => `
+                    <div class="member-card-item">
                         <div class="member-card-header">
-                            <div class="member-avatar">${initial}</div>
+                            <div class="member-avatar">${m.full_name.charAt(0)}</div>
                             <div class="member-info">
                                 <div class="name">${m.full_name}</div>
                                 <div class="code">${m.member_id}</div>
                             </div>
                         </div>
                         <div class="member-stats-box">
-                            <div class="stat-line"><span>Bal:</span> <span class="val-green">${formatNaira(m.net_balance)}</span></div>
-                            <div class="stat-line"><span>Target:</span> <span>${formatNaira(m.daily_target)}</span></div>
-                            <div class="stat-line"><span>Loan:</span> <span class="val-red">${formatNaira(m.active_loan)}</span></div>
+                            <div class="stat-line"><span>Saved:</span> <span class="val-green">₦${m.total_saved.toLocaleString()}</span></div>
+                            <div class="stat-line"><span>Net:</span> <span>₦${m.net_balance.toLocaleString()}</span></div>
                         </div>
-                        <div class="cycle-status-btn">
-                            🔄 C${m.current_cycle} (${m.cycle_days}/31d)
-                        </div>
+                        <div class="cycle-status-btn">🔄 Cycle ${m.current_cycle} (${m.cycle_days}/31d)</div>
                     </div>
-                `;
-            });
-        }
-
-        function renderManageMembersTable() {
-            const tbody = document.getElementById('manage-members-table-body');
-            tbody.innerHTML = '';
-
-            let sumDailyTarget = 0;
-
-            if (globalMembers.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; padding:1.5rem; color:var(--text-muted);">No registered members.</td></tr>';
-                document.getElementById('manage-total-daily-target').innerText = formatNaira(0);
-                return;
-            }
-
-            globalMembers.forEach(m => {
-                sumDailyTarget += parseFloat(m.daily_target || 0);
-                tbody.innerHTML += `
-                    <tr>
-                        <td><strong>${m.member_id}</strong></td>
-                        <td>${m.full_name}</td>
-                        <td>${formatNaira(m.daily_target)}</td>
-                        <td>
-                            <button class="btn-edit-sm" onclick="openMemberModal('${m.member_id}')">✏️ Edit</button>
-                            <button class="btn-delete-sm" onclick="deleteMemberDirect('${m.member_id}')">🗑️ Delete</button>
-                        </td>
-                    </tr>
-                `;
-            });
-
-            document.getElementById('manage-total-daily-target').innerText = formatNaira(sumDailyTarget);
-        }
-
-        async function openMemberModal(memberId) {
-            const res = await fetch(`/api/member/${memberId}`);
-            const data = await res.json();
-
-            if (!data.success) {
-                showToast("Member details not found.", "error");
-                return;
-            }
-
-            const m = data.member;
-            currentModalMember = m;
-
-            document.getElementById('modal-member-name-title').innerText = `${m.full_name} (${m.member_id})`;
-            document.getElementById('modal-target').innerText = formatNaira(m.daily_target);
-            document.getElementById('modal-balance').innerText = formatNaira(m.net_balance);
-            document.getElementById('modal-service-fees').innerText = formatNaira(m.total_service_fees);
-            document.getElementById('modal-loan').innerText = formatNaira(m.active_loan);
-            document.getElementById('modal-cycle-val').innerText = `🔄 Cycle ${m.current_cycle} (${m.cycle_days} / 31 days)`;
-
-            document.getElementById('modal-edit-fullname').value = m.full_name;
-            document.getElementById('modal-edit-target').value = m.daily_target;
-            document.getElementById('modal-edit-username').value = m.username || '';
-            document.getElementById('modal-edit-password').value = '';
-
-            const tbody = document.getElementById('modal-recent-savings-body');
-            tbody.innerHTML = '';
-
-            if (data.recent_savings.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; color:var(--text-muted);">No contribution history.</td></tr>';
-            } else {
-                data.recent_savings.forEach(s => {
-                    tbody.innerHTML += `
-                        <tr>
-                            <td>${s.date}</td>
-                            <td style="color:var(--primary-green-dark); font-weight:800;">${formatNaira(s.amount)}</td>
-                            <td>${s.days_credited}</td>
-                            <td>
-                                <button class="btn-delete-sm" onclick="deleteContribution(${s.id})">
-                                    🗑️ Delete
-                                </button>
-                            </td>
-                        </tr>
-                    `;
-                });
-            }
-
-            switchModalTab('overview');
-            document.getElementById('member-profile-modal').classList.add('active');
-        }
-
-        function closeMemberModal() {
-            document.getElementById('member-profile-modal').classList.remove('active');
-        }
-
-        function switchModalTab(tabName) {
-            document.querySelectorAll('.modal-tab').forEach(t => t.classList.remove('active'));
-            document.querySelectorAll('.modal-tab-panel').forEach(p => p.classList.remove('active'));
-
-            const targetTab = Array.from(document.querySelectorAll('.modal-tab')).find(el => el.innerText.toLowerCase().includes(tabName));
-            if (targetTab) targetTab.classList.add('active');
-
-            const panel = document.getElementById(`modal-panel-${tabName}`);
-            if (panel) panel.classList.add('active');
-        }
-
-        function handleGlobalSearchInput(e) {
-            const query = e.target.value.trim().toLowerCase();
-            const dropdown = document.getElementById('search-results-dropdown');
-            dropdown.innerHTML = '';
-
-            const digitsOnly = query.replace(/\D/g, '');
-
-            if (digitsOnly.length >= 2 || query.length >= 2) {
-                const matches = globalMembers.filter(m => 
-                    m.member_id.toLowerCase().includes(query) ||
-                    m.full_name.toLowerCase().includes(query) ||
-                    m.member_id.replace(/\D/g, '').includes(digitsOnly)
-                );
-
-                if (matches.length > 0) {
-                    dropdown.style.display = 'block';
-                    matches.forEach(m => {
-                        dropdown.innerHTML += `
-                            <div class="search-result-item" onclick="selectSearchMember('${m.member_id}')">
-                                <div>
-                                    <strong>${m.full_name}</strong> (${m.member_id})
-                                </div>
-                                <span style="color:var(--primary-green-dark);">${formatNaira(m.net_balance)}</span>
-                            </div>
-                        `;
-                    });
-                } else {
-                    dropdown.style.display = 'block';
-                    dropdown.innerHTML = '<div class="search-result-item" style="color:var(--text-muted);">No matching member found</div>';
-                }
-            } else {
-                dropdown.style.display = 'none';
+                `).join('');
             }
         }
 
-        function selectSearchMember(memberId) {
-            document.getElementById('search-results-dropdown').style.display = 'none';
-            document.getElementById('global-search-input').value = '';
-            openMemberModal(memberId);
-        }
-
-        function handleSavingsSearchInput(e) {
-            const query = e.target.value.trim().toLowerCase();
-            const dropdown = document.getElementById('savings-search-dropdown');
-            document.getElementById('savings-member-id').value = ''; 
-            dropdown.innerHTML = '';
-
-            const digitsOnly = query.replace(/\D/g, '');
-
-            if (digitsOnly.length >= 2 || query.length >= 2) {
-                const matches = globalMembers.filter(m => 
-                    m.member_id.toLowerCase().includes(query) ||
-                    m.full_name.toLowerCase().includes(query) ||
-                    m.member_id.replace(/\D/g, '').includes(digitsOnly)
-                );
-
-                if (matches.length > 0) {
-                    dropdown.style.display = 'block';
-                    matches.forEach(m => {
-                        const safeName = m.full_name.replace(/'/g, "\\'");
-                        dropdown.innerHTML += `
-                            <div class="search-result-item" onclick="selectSavingsMember('${m.member_id}', '${safeName} (${m.member_id})')">
-                                <div>
-                                    <strong>${m.full_name}</strong> (${m.member_id})
-                                </div>
-                                <span style="color:var(--primary-green-dark);">${formatNaira(m.net_balance)}</span>
-                            </div>
-                        `;
-                    });
-                } else {
-                    dropdown.style.display = 'block';
-                    dropdown.innerHTML = '<div class="search-result-item" style="color:var(--text-muted);">No matching member found</div>';
-                }
-            } else {
-                dropdown.style.display = 'none';
-            }
-        }
-
-        function selectSavingsMember(memberId, displayName) {
-            document.getElementById('savings-member-search').value = displayName;
-            document.getElementById('savings-member-id').value = memberId;
-            document.getElementById('savings-search-dropdown').style.display = 'none';
-        }
-
-        function handleWithdrawalSearchInput(e) {
-            const query = e.target.value.trim().toLowerCase();
-            const dropdown = document.getElementById('withdrawal-search-dropdown');
-            document.getElementById('withdrawal-member-id').value = ''; 
-            dropdown.innerHTML = '';
-
-            const digitsOnly = query.replace(/\D/g, '');
-
-            if (digitsOnly.length >= 2 || query.length >= 2) {
-                const matches = globalMembers.filter(m => 
-                    m.member_id.toLowerCase().includes(query) ||
-                    m.full_name.toLowerCase().includes(query) ||
-                    m.member_id.replace(/\D/g, '').includes(digitsOnly)
-                );
-
-                if (matches.length > 0) {
-                    dropdown.style.display = 'block';
-                    matches.forEach(m => {
-                        const safeName = m.full_name.replace(/'/g, "\\'");
-                        dropdown.innerHTML += `
-                            <div class="search-result-item" onclick="selectWithdrawalMember('${m.member_id}', '${safeName} (${m.member_id})')">
-                                <div>
-                                    <strong>${m.full_name}</strong> (${m.member_id})
-                                </div>
-                                <span style="color:var(--primary-green-dark);">${formatNaira(m.net_balance)}</span>
-                            </div>
-                        `;
-                    });
-                } else {
-                    dropdown.style.display = 'block';
-                    dropdown.innerHTML = '<div class="search-result-item" style="color:var(--text-muted);">No matching member found</div>';
-                }
-            } else {
-                dropdown.style.display = 'none';
-            }
-        }
-
-        function selectWithdrawalMember(memberId, displayName) {
-            document.getElementById('withdrawal-member-search').value = displayName;
-            document.getElementById('withdrawal-member-id').value = memberId;
-            document.getElementById('withdrawal-search-dropdown').style.display = 'none';
-        }
-
-        function handleHistorySearchInput(e) {
-            const query = e.target.value.trim().toLowerCase();
-            const dropdown = document.getElementById('history-search-dropdown');
-            dropdown.innerHTML = '';
-
-            const digitsOnly = query.replace(/\D/g, '');
-
-            if (digitsOnly.length >= 2 || query.length >= 2) {
-                const matches = globalMembers.filter(m => 
-                    m.member_id.toLowerCase().includes(query) ||
-                    m.full_name.toLowerCase().includes(query) ||
-                    m.member_id.replace(/\D/g, '').includes(digitsOnly)
-                );
-
-                if (matches.length > 0) {
-                    dropdown.style.display = 'block';
-                    matches.forEach(m => {
-                        dropdown.innerHTML += `
-                            <div class="search-result-item" onclick="loadMemberContributionHistory('${m.member_id}')">
-                                <div>
-                                    <strong>${m.full_name}</strong> (${m.member_id})
-                                </div>
-                                <span style="color:var(--primary-green-dark);">${formatNaira(m.net_balance)}</span>
-                            </div>
-                        `;
-                    });
-                } else {
-                    dropdown.style.display = 'block';
-                    dropdown.innerHTML = '<div class="search-result-item" style="color:var(--text-muted);">No matching member found</div>';
-                }
-            } else {
-                dropdown.style.display = 'none';
-            }
-        }
-
-        async function loadMemberContributionHistory(memberId) {
-            document.getElementById('history-search-dropdown').style.display = 'none';
-            document.getElementById('history-member-search').value = '';
-
-            const res = await fetch(`/api/member/${memberId}/history`);
-            const data = await res.json();
-
-            if (data.success) {
-                document.getElementById('history-results-container').style.display = 'block';
-                document.getElementById('history-member-name').innerText = `${data.member.full_name} (${memberId})`;
-                document.getElementById('history-member-target').innerText = `Target: ${formatNaira(data.member.daily_target)} | C${data.member.current_cycle} (${data.member.cycle_days}/31d)`;
-
-                const tbody = document.getElementById('history-table-body');
-                tbody.innerHTML = '';
-
-                if (data.history.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; color:var(--text-muted); padding:1.5rem;">No recorded transaction history for this member.</td></tr>';
-                } else {
-                    data.history.forEach(h => {
-                        const isFee = h.category === 'Service Fee';
-                        const isWithdrawal = h.category === 'Withdrawal';
-                        tbody.innerHTML += `
-                            <tr>
-                                <td><span class="badge ${isFee ? 'badge-fee' : (isWithdrawal ? 'badge-payout' : 'badge-savings')}">${h.category}</span></td>
-                                <td style="font-weight:800; color:${isWithdrawal ? 'var(--primary-red)' : 'var(--primary-green-dark)'}">${formatNaira(h.amount)}</td>
-                                <td>${h.date}</td>
-                                <td>${h.days_credited || 0}</td>
-                                <td>${h.notes || ''}</td>
-                            </tr>
-                        `;
-                    });
-                }
-            }
-        }
-
-        async function loadPastRecords() {
-            const res = await fetch('/api/archives');
-            globalArchiveLogs = await res.json();
-            filterArchiveRecords();
-        }
-
-        function filterArchiveRecords() {
-            const searchVal = document.getElementById('archive-search-input').value.toLowerCase();
-            const tbody = document.getElementById('archive-table-body');
-            tbody.innerHTML = '';
-
-            const filtered = globalArchiveLogs.filter(a => 
-                a.full_name.toLowerCase().includes(searchVal) || 
-                a.member_id.toLowerCase().includes(searchVal) ||
-                a.tx_type.toLowerCase().includes(searchVal)
-            );
-
-            if (filtered.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color:var(--text-muted); padding:1.5rem;">No archive records found.</td></tr>';
-                return;
-            }
-
-            filtered.forEach(a => {
-                tbody.innerHTML += `
-                    <tr>
-                        <td><strong>${a.full_name}</strong><br><span style="font-size:0.75rem; color:var(--text-muted);">${a.member_id}</span></td>
-                        <td><span class="badge badge-savings">${a.tx_type}</span></td>
-                        <td style="font-weight:800; color:var(--primary-green-dark);">${formatNaira(a.amount)}</td>
-                        <td>Cycle ${a.cycle_no}</td>
-                        <td>${a.date}</td>
-                        <td style="font-size:0.75rem; color:var(--text-muted);">${a.notes || ''}</td>
-                    </tr>
-                `;
-            });
-        }
-
-        async function deleteMemberDirect(memberId) {
-            const confirmed = await showCustomConfirm("Delete Member", `Are you sure you want to permanently delete member ${memberId}?`);
-            if (confirmed) {
-                const res = await fetch(`/api/member/${memberId}`, { method: 'DELETE' });
-                const result = await res.json();
-                if (result.success) {
-                    showToast(result.message);
-                    await fetchAndRenderMembers();
-                    renderManageMembersTable();
-                } else {
-                    showToast(result.message, 'error');
-                }
-            }
-        }
-
-        async function triggerResetMemberLedger() {
-            if (!currentModalMember) return;
-            const confirmed = await showCustomConfirm(
-                "Reset Member Financial Data", 
-                `Are you sure you want to clear active ledgers for ${currentModalMember.full_name} (${currentModalMember.member_id})? Profile remains intact and all history is permanently kept in Past Records.`
-            );
-            if (confirmed) {
-                const res = await fetch(`/api/member/${currentModalMember.member_id}/reset-ledger`, { method: 'POST' });
-                const result = await res.json();
-                if (result.success) {
-                    showToast(result.message);
-                    await fetchAndRenderMembers();
-                    openMemberModal(currentModalMember.member_id);
-                } else {
-                    showToast(result.message, 'error');
-                }
-            }
-        }
-
-        async function triggerDeleteMemberCurrent() {
-            if (!currentModalMember) return;
-            const confirmed = await showCustomConfirm("Delete Member Account", `Permanently delete ${currentModalMember.full_name} (${currentModalMember.member_id})?`);
-            if (confirmed) {
-                const res = await fetch(`/api/member/${currentModalMember.member_id}`, { method: 'DELETE' });
-                const result = await res.json();
-                if (result.success) {
-                    showToast(result.message);
-                    closeMemberModal();
-                    await fetchAndRenderMembers();
-                    renderManageMembersTable();
-                } else {
-                    showToast(result.message, 'error');
-                }
-            }
-        }
-
-        async function handleModalSave(e) {
-            e.preventDefault();
-            const payload = {
-                member_id: currentModalMember.member_id,
-                amount: document.getElementById('modal-save-amount').value,
-                date: document.getElementById('modal-save-date').value
-            };
-
-            const res = await fetch('/api/savings', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-            const result = await res.json();
-
-            if (result.success) {
-                showToast(result.message);
-                document.getElementById('modal-save-amount').value = '';
-                openMemberModal(currentModalMember.member_id);
-                fetchAndRenderMembers();
-            } else {
-                showToast(result.message, 'error');
-            }
-        }
-
-        async function handleModalWithdraw(e) {
-            e.preventDefault();
-            const payload = {
-                member_id: currentModalMember.member_id,
-                amount: document.getElementById('modal-withdraw-amount').value,
-                withdrawal_type: document.getElementById('modal-withdraw-type').value,
-                date: todayStr
-            };
-
-            const res = await fetch('/api/withdrawals', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-            const result = await res.json();
-
-            if (result.success) {
-                showToast(result.message);
-                document.getElementById('modal-withdraw-amount').value = '';
-                openMemberModal(currentModalMember.member_id);
-                fetchAndRenderMembers();
-            } else {
-                showToast(result.message, 'error');
-            }
-        }
-
-        async function handleModalLoan(e) {
-            e.preventDefault();
-            const payload = {
-                member_id: currentModalMember.member_id,
-                amount: document.getElementById('modal-loan-amount').value,
-                issue_date: todayStr
-            };
-
-            const res = await fetch('/api/loans', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-            const result = await res.json();
-
-            if (result.success) {
-                showToast(result.message);
-                document.getElementById('modal-loan-amount').value = '';
-                openMemberModal(currentModalMember.member_id);
-                fetchAndRenderMembers();
-            } else {
-                showToast(result.message, 'error');
-            }
-        }
-
-        async function handleModalUpdateMember(e) {
-            e.preventDefault();
-            const payload = {
-                full_name: document.getElementById('modal-edit-fullname').value,
-                daily_target: document.getElementById('modal-edit-target').value,
-                username: document.getElementById('modal-edit-username').value.trim(),
-                password: document.getElementById('modal-edit-password').value.trim()
-            };
-
-            const res = await fetch(`/api/member/${currentModalMember.member_id}`, {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-            const result = await res.json();
-
-            if (result.success) {
-                showToast(result.message);
-                openMemberModal(currentModalMember.member_id);
-                fetchAndRenderMembers();
-            } else {
-                showToast(result.message, 'error');
-            }
-        }
-
-        async function deleteContribution(savingsId) {
-            const confirmed = await showCustomConfirm("Delete Contribution", "Are you sure you want to delete this deposit entry?");
-            if (confirmed) {
-                const res = await fetch(`/api/savings/${savingsId}`, { method: 'DELETE' });
-                const result = await res.json();
-                if (result.success) {
-                    showToast(result.message);
-                    openMemberModal(currentModalMember.member_id);
-                    fetchAndRenderMembers();
-                }
-            }
-        }
-
-        async function loadOverview() {
+        async function loadOverviewStats() {
             const res = await fetch('/api/stats/overview');
-            const data = await res.json();
-
-            document.getElementById('stat-total-saved').innerText = formatNaira(data.total_savings);
-            document.getElementById('stat-service-fees').innerText = formatNaira(data.total_fees);
-            document.getElementById('stat-net-balance').innerText = formatNaira(data.net_balance);
+            const d = await res.json();
+            document.getElementById('stat-total-saved').innerText = `₦${d.total_savings.toLocaleString()}`;
+            document.getElementById('stat-service-fees').innerText = `₦${d.total_fees.toLocaleString()}`;
+            document.getElementById('stat-net-balance').innerText = `₦${d.net_balance.toLocaleString()}`;
         }
 
         async function handleSavingsSubmit(e) {
             e.preventDefault();
-            const memberId = document.getElementById('savings-member-id').value;
-            if (!memberId) {
-                showToast("Please search and select a valid member first.", "error");
-                return;
-            }
-
             const payload = {
-                member_id: memberId,
+                member_id: document.getElementById('savings-member-select').value,
                 amount: document.getElementById('savings-amount').value,
                 date: document.getElementById('savings-date').value,
                 notes: document.getElementById('savings-notes').value
             };
-
             const res = await fetch('/api/savings', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify(payload)
             });
-            const result = await res.json();
-
-            if (result.success) {
-                showToast(result.message);
-                document.getElementById('form-add-savings').reset();
-                document.getElementById('savings-member-id').value = '';
-                document.getElementById('savings-search-dropdown').style.display = 'none';
-                document.getElementById('savings-date').value = todayStr;
-                await fetchAndRenderMembers();
-                showSection('overview');
-            } else {
-                showToast(result.message, 'error');
-            }
+            const d = await res.json();
+            if (d.success) {
+                showToast(d.message);
+                document.getElementById('savings-amount').value = '';
+                goBackHome();
+            } else showToast(d.message, 'error');
         }
 
         async function handleWithdrawalSubmit(e) {
             e.preventDefault();
-            const memberId = document.getElementById('withdrawal-member-id').value;
-            if (!memberId) {
-                showToast("Please search and select a member first.", "error");
-                return;
-            }
-
             const payload = {
-                member_id: memberId,
-                amount: document.getElementById('withdrawal-amount').value,
-                withdrawal_type: document.getElementById('withdrawal-type').value,
-                date: document.getElementById('withdrawal-date').value
+                member_id: document.getElementById('withdraw-member-select').value,
+                amount: document.getElementById('withdraw-amount').value,
+                date: document.getElementById('withdraw-date').value
             };
-
             const res = await fetch('/api/withdrawals', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify(payload)
             });
-            const result = await res.json();
-
-            if (result.success) {
-                showToast(result.message);
-                document.getElementById('form-withdrawal').reset();
-                document.getElementById('withdrawal-member-id').value = '';
-                document.getElementById('withdrawal-search-dropdown').style.display = 'none';
-                document.getElementById('withdrawal-date').value = todayStr;
-                await fetchAndRenderMembers();
-                showSection('overview');
-            } else {
-                showToast(result.message, 'error');
-            }
+            const d = await res.json();
+            if (d.success) {
+                showToast(d.message);
+                document.getElementById('withdraw-amount').value = '';
+                goBackHome();
+            } else showToast(d.message, 'error');
         }
 
-        async function handleMemberRegister(e) {
+        async function handleRegisterSubmit(e) {
             e.preventDefault();
             const payload = {
-                full_name: document.getElementById('reg-fullname').value.trim(),
+                full_name: document.getElementById('reg-fullname').value,
                 daily_target: document.getElementById('reg-target').value
             };
-
-            try {
-                const res = await fetch('/api/members', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
-                });
-                const result = await res.json();
-
-                if (result.success) {
-                    showToast(result.message);
-                    document.getElementById('form-register-member').reset();
-                    await fetchAndRenderMembers();
-                    showSection('members');
-                } else {
-                    showToast(result.message, 'error');
-                }
-            } catch (err) {
-                showToast("Connection error while registering member.", "error");
-            }
-        }
-
-        async function loadLoans() {
-            const res = await fetch('/api/loans');
-            const loans = await res.json();
-            const tbody = document.getElementById('loans-table-body');
-            tbody.innerHTML = '';
-
-            if (loans.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; color:var(--text-muted); padding:1.5rem;">No member loans found.</td></tr>';
-                return;
-            }
-
-            loans.forEach(l => {
-                const balance = l.repayment_amount - l.amount_paid;
-                const isCleared = l.status === 'cleared';
-                tbody.innerHTML += `
-                    <tr>
-                        <td>
-                            <strong>${l.full_name}</strong><br>
-                            <span style="font-size:0.75rem; color:var(--text-muted);">${l.member_id}</span>
-                        </td>
-                        <td>${formatNaira(l.amount)}</td>
-                        <td>${formatNaira(l.repayment_amount)} (0%)</td>
-                        <td style="color:var(--primary-green-dark); font-weight:700;">${formatNaira(l.amount_paid)}</td>
-                        <td style="color:var(--primary-red); font-weight:800;">${formatNaira(balance)}</td>
-                        <td>
-                            <span class="badge ${isCleared ? 'badge-success' : 'badge-warning'}">
-                                ${l.status.toUpperCase()}
-                            </span>
-                        </td>
-                        <td>
-                            ${!isCleared ? `<button class="btn-repay-sm" onclick="promptLoanRepay(${l.id})">Repay</button>` : '-'}
-                        </td>
-                    </tr>
-                `;
-            });
-        }
-
-        async function promptLoanRepay(loanId) {
-            const amount = await showCustomPrompt("Loan Repayment", "Enter Repayment Amount (₦):");
-            if (amount && parseFloat(amount) > 0) {
-                const res = await fetch('/api/loans/repay', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ loan_id: loanId, amount: amount, date: todayStr })
-                });
-                const result = await res.json();
-                if (result.success) {
-                    showToast(result.message);
-                    loadLoans();
-                    fetchAndRenderMembers();
-                } else {
-                    showToast(result.message, 'error');
-                }
-            }
-        }
-
-        async function loadTracker() {
-            const dateVal = document.getElementById('tracker-date-filter').value;
-            const res = await fetch(`/api/tracker/daily?date=${dateVal}`);
-            const data = await res.json();
-
-            document.getElementById('tracker-summary-inflow').innerText = formatNaira(data.total_inflow);
-            document.getElementById('tracker-summary-fees').innerText = formatNaira(data.total_service_fees);
-            document.getElementById('tracker-summary-outflow').innerText = formatNaira(data.total_outflow);
-            document.getElementById('tracker-summary-net').innerText = formatNaira(data.net_cashflow);
-
-            const tbody = document.getElementById('tracker-table-body');
-            tbody.innerHTML = '';
-
-            if (data.logs.length === 0) {
-                tbody.innerHTML = `<tr><td colspan="6" style="text-align:center; color:var(--text-muted); padding:1.5rem;">No activity recorded for ${dateVal || 'all dates'}.</td></tr>`;
-                return;
-            }
-
-            data.logs.forEach(r => {
-                const isInflow = r.gross_inflow > 0;
-                tbody.innerHTML += `
-                    <tr>
-                        <td><strong>${r.date}</strong></td>
-                        <td>${r.full_name} <br><span style="font-size:0.75rem; color:var(--text-muted);">${r.member_id}</span></td>
-                        <td style="color:var(--primary-green-dark); font-weight:800;">${r.gross_inflow > 0 ? '+ ' + formatNaira(r.gross_inflow) : '-'}</td>
-                        <td style="color:var(--amber-fee); font-weight:800;">${r.service_fee > 0 ? formatNaira(r.service_fee) : '-'}</td>
-                        <td style="color:var(--primary-red); font-weight:800;">${r.outflow > 0 ? '- ' + formatNaira(r.outflow) : '-'}</td>
-                        <td>
-                            <span class="badge ${isInflow ? 'badge-savings' : 'badge-payout'}">${r.tx_type}</span>
-                            <div style="font-size:0.75rem; color:var(--text-muted); margin-top:2px;">${r.notes || ''}</div>
-                        </td>
-                    </tr>
-                `;
-            });
-        }
-
-        function clearTrackerDateFilter() {
-            document.getElementById('tracker-date-filter').value = '';
-            loadTracker();
-        }
-
-        async function loadServiceFees() {
-            const monthVal = document.getElementById('fees-month-filter').value;
-            const res = await fetch(`/api/service-fees?month=${monthVal}`);
-            const data = await res.json();
-
-            document.getElementById('fees-summary-total').innerText = formatNaira(data.total_fees);
-
-            const tbody = document.getElementById('fees-table-body');
-            tbody.innerHTML = '';
-
-            if (data.fees.length === 0) {
-                tbody.innerHTML = `<tr><td colspan="5" style="text-align:center; color:var(--text-muted); padding:1.5rem;">No service fees collected for ${monthVal || 'all months'}.</td></tr>`;
-                return;
-            }
-
-            data.fees.forEach(f => {
-                tbody.innerHTML += `
-                    <tr>
-                        <td>${f.full_name} <br><span style="font-size:0.75rem; color:var(--text-muted);">${f.member_id}</span></td>
-                        <td style="color:var(--amber-fee); font-weight:800;">${formatNaira(f.amount)}</td>
-                        <td>${f.month_year}</td>
-                        <td>${f.date}</td>
-                        <td><span class="badge badge-fee">${f.description || 'Service Fee'}</span></td>
-                    </tr>
-                `;
-            });
-        }
-
-        function clearFeesMonthFilter() {
-            document.getElementById('fees-month-filter').value = '';
-            loadServiceFees();
-        }
-
-        async function resyncLedger() {
-            const res = await fetch('/api/maintenance/resync', { method: 'POST' });
-            const result = await res.json();
-            showToast(result.message);
-        }
-
-        async function triggerResetAllSystemLedgers() {
-            const confirmed = await showCustomConfirm("Reset Active Ledgers", "Clear current active financial tables? Members and past audit archive records remain fully preserved.");
-            if (confirmed) {
-                const res = await fetch('/api/maintenance/reset-all-ledgers', { method: 'POST' });
-                const result = await res.json();
-                if (result.success) {
-                    showToast(result.message);
-                    fetchAndRenderMembers();
-                    showSection('home');
-                } else {
-                    showToast(result.message, 'error');
-                }
-            }
-        }
-
-        async function handlePasswordUpdate(e) {
-            e.preventDefault();
-            const payload = {
-                old_password: document.getElementById('pass-old').value,
-                new_password: document.getElementById('pass-new').value
-            };
-
-            const res = await fetch('/api/admin/password', {
+            const res = await fetch('/api/members', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify(payload)
             });
-            const result = await res.json();
+            const d = await res.json();
+            if (d.success) {
+                showToast(d.message);
+                document.getElementById('reg-fullname').value = '';
+                goBackHome();
+            } else showToast(d.message, 'error');
+        }
 
-            if (result.success) {
-                showToast(result.message);
-                document.getElementById('form-password').reset();
-            } else {
-                showToast(result.message, 'error');
+        async function loadMemberPortal(memberId) {
+            const res = await fetch(`/api/member/${memberId}`);
+            const d = await res.json();
+            if (d.success) {
+                const m = d.member;
+                document.getElementById('mportal-name').innerText = m.full_name;
+                document.getElementById('mportal-id').innerText = `ID: ${m.member_id}`;
+                document.getElementById('mportal-balance').innerText = `₦${m.net_balance.toLocaleString()}`;
+                document.getElementById('mportal-target').innerText = `₦${m.daily_target.toLocaleString()}`;
+                document.getElementById('mportal-fees').innerText = `₦${m.total_service_fees.toLocaleString()}`;
+                document.getElementById('mportal-loan').innerText = `₦${m.active_loan.toLocaleString()}`;
+
+                const table = document.getElementById('mportal-savings-table');
+                table.innerHTML = d.recent_savings.map(s => `
+                    <tr>
+                        <td>${s.date}</td>
+                        <td>₦${s.amount.toLocaleString()}</td>
+                        <td>${s.days_credited} days</td>
+                    </tr>
+                `).join('');
             }
         }
 
-        window.onload = () => {
-            checkAuthSession();
-        };
+        window.onload = initApp;
     </script>
 </body>
 </html>
 """
-
-@app.route('/')
-def homepage():
-    return render_template_string(INDEX_TEMPLATE)
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
