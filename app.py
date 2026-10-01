@@ -453,7 +453,6 @@ def member_detail_update_delete(member_id):
             'recent_savings': savings
         })
 
-# REQ 4: FULL MEMBER CONTRIBUTION HISTORY (ACTIVE + ARCHIVES)
 @app.route('/api/member/<member_id>/history', methods=['GET'])
 def get_member_full_history(member_id):
     db = get_db()
@@ -518,7 +517,7 @@ def reset_single_member_ledger(member_id):
     return jsonify({'success': True, 'message': f'Financial data for {m["full_name"]} ({actual_id}) reset successfully!'})
 
 # -----------------------------------------------------------------------------
-# BULK SAVINGS & MULTI-CYCLE FEE LOGIC (REQ 3: SPREAD SERVICE FEES ACROSS MONTHS)
+# BULK SAVINGS & MULTI-MONTH SERVICE FEE SPREADING
 # -----------------------------------------------------------------------------
 @app.route('/api/savings', methods=['GET', 'POST'])
 def handle_savings():
@@ -551,7 +550,7 @@ def handle_savings():
         daily_target = m['daily_target'] if m['daily_target'] > 0 else 500.0
 
         base_date = datetime.strptime(savings_date_str, '%Y-%m-%d')
-        accumulated_days = 0
+        days_credited_so_far = 0
 
         remaining_cash = deposit_amount
         total_fees_collected = 0.0
@@ -559,14 +558,15 @@ def handle_savings():
         total_days_added = 0
         fee_records = []
 
+        # ACCURATELY SPREAD SERVICE FEES ACROSS ALL CONCERNED FUTURE MONTHS
         while remaining_cash > 0:
             if cycle_days == 0:
                 fee_deducted = min(daily_target, remaining_cash)
                 remaining_cash -= fee_deducted
                 total_fees_collected += fee_deducted
 
-                # REQ 3: Calculate spread date for fee across concerned month
-                target_fee_date = base_date + timedelta(days=accumulated_days)
+                # Calculate target date for this cycle's service fee
+                target_fee_date = base_date + timedelta(days=days_credited_so_far)
                 fee_date_fmt = target_fee_date.strftime('%Y-%m-%d')
                 fee_month_fmt = target_fee_date.strftime('%Y-%m')
 
@@ -593,7 +593,7 @@ def handle_savings():
                 total_savings_credited += cash_spent
                 total_days_added += days_bought
                 cycle_days += days_bought
-                accumulated_days += days_bought
+                days_credited_so_far += days_bought
 
             if days_bought == 0 and remaining_cash < daily_target and cycle_days > 0:
                 break
@@ -602,7 +602,7 @@ def handle_savings():
                 current_cycle += 1
                 cycle_days = 0
 
-        # INSERT EXTRACTED SERVICE FEE RECORDS WITH CONCERNED SPREAD DATES
+        # INSERT EXTRACTED SERVICE FEES DATED BY CONCERNED MONTHS
         for f in fee_records:
             cursor.execute(f'''
                 INSERT INTO savings (member_id, amount, date, month_year, is_service_fee, days_credited, notes)
@@ -632,7 +632,7 @@ def handle_savings():
 
         msg = f"Processed ₦{deposit_amount:,.2f} for {full_name}! "
         if total_fees_collected > 0:
-            msg += f"₦{total_fees_collected:,.2f} extracted in service fees. "
+            msg += f"₦{total_fees_collected:,.2f} extracted in service fees across concerned months. "
         msg += f"₦{total_savings_credited:,.2f} saved in bulk ({total_days_added} days credited). "
         msg += f"Status: Cycle {current_cycle} ({cycle_days} / 31 days)."
 
@@ -815,7 +815,7 @@ def repay_loan():
     return jsonify({'success': True, 'message': 'Loan repayment recorded!'})
 
 # -----------------------------------------------------------------------------
-# DAILY TRACKER (REQ 5: CONSOLIDATE GROSS INFLOW & SERVICE FEE COLUMN)
+# DAILY TRACKER
 # -----------------------------------------------------------------------------
 @app.route('/api/tracker/daily', methods=['GET'])
 def get_daily_tracker():
@@ -856,7 +856,6 @@ def get_daily_tracker():
     cursor.execute(query, tuple(params))
     rows = cursor.fetchall()
 
-    # REQ 5: Aggregate bulk savings so Gross Inflow and Service Fee are in one row
     logs = []
     grouped_savings = {}
 
@@ -894,9 +893,8 @@ def get_daily_tracker():
                 'notes': dict_r['notes']
             })
 
-    # Add grouped deposit items
     for k, grp in grouped_savings.items():
-        grp['gross_inflow'] += grp['service_fee'] # Total deposit gross
+        grp['gross_inflow'] += grp['service_fee']
         logs.append(grp)
 
     logs.sort(key=lambda x: x['date'], reverse=True)
@@ -1065,7 +1063,7 @@ INDEX_TEMPLATE = """
         .toast.error { background: var(--primary-red); }
         @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
 
-        /* REQ 1: STICKY TOP WRAPPER (HEADER + SEARCH BAR DO NOT SCROLL) */
+        /* REQ 1: STICKY TOP CONTAINER (HEADER, BACK BUTTON, AND SEARCH BAR FIXED AT TOP) */
         .sticky-header-container {
             position: sticky;
             top: 0;
@@ -1076,7 +1074,7 @@ INDEX_TEMPLATE = """
         }
 
         header {
-            padding: 0.85rem 1rem;
+            padding: 0.85rem 1rem 0.4rem 1rem;
             display: flex; justify-content: space-between; align-items: center;
         }
         header .brand-box { display: flex; align-items: center; gap: 10px; cursor: pointer; }
@@ -1100,8 +1098,37 @@ INDEX_TEMPLATE = """
             cursor: pointer; min-height: 36px;
         }
 
-        .search-container { padding: 0.4rem 1rem 0.85rem 1rem; max-width: 600px; margin: 0 auto; width: 100%; position: relative; }
-        .search-wrapper { position: relative; width: 100%; }
+        /* SEARCH BAR & NON-SCROLLABLE BACK BUTTON ROW */
+        .sticky-nav-bar {
+            padding: 0.2rem 1rem 0.75rem 1rem;
+            max-width: 600px;
+            margin: 0 auto;
+            width: 100%;
+            position: relative;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .btn-back-sticky {
+            background: #0f172a;
+            color: #ffffff;
+            border: none;
+            padding: 9px 14px;
+            border-radius: 20px;
+            font-weight: 800;
+            font-size: 0.82rem;
+            cursor: pointer;
+            display: none; /* Auto-shown on sub-pages */
+            align-items: center;
+            gap: 6px;
+            white-space: nowrap;
+            flex-shrink: 0;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+        }
+        .btn-back-sticky:active { transform: scale(0.96); }
+
+        .search-wrapper { position: relative; width: 100%; flex: 1; }
         .search-wrapper i { position: absolute; left: 16px; top: 50%; transform: translateY(-50%); color: #94a3b8; font-size: 0.95rem; }
         .search-input {
             width: 100%; padding: 10px 16px 10px 42px; border-radius: 30px;
@@ -1126,10 +1153,6 @@ INDEX_TEMPLATE = """
 
         .view-header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.1rem; }
         .view-title-group { display: flex; align-items: center; gap: 8px; font-size: 1.15rem; font-weight: 800; }
-        .btn-back {
-            background: #e2e8f0; color: var(--text-dark); border: none;
-            padding: 8px 14px; border-radius: 10px; font-weight: 700; font-size: 0.82rem; cursor: pointer;
-        }
         .btn-add-header {
             background: var(--primary-green); color: #ffffff; border: none;
             padding: 8px 14px; border-radius: 10px; font-weight: 700; font-size: 0.82rem; cursor: pointer;
@@ -1359,7 +1382,7 @@ INDEX_TEMPLATE = """
 
     <div id="toast-container"></div>
 
-    <!-- REQ 1: STICKY TOP CONTAINER (HEADER + SEARCH BAR STAYS AT TOP) -->
+    <!-- REQ 1: STICKY TOP WRAPPER (HEADER, BACK BUTTON, AND SEARCH BAR FIXED AT TOP) -->
     <div class="sticky-header-container">
         <header>
             <div class="brand-box" onclick="handleHeaderClick()">
@@ -1376,8 +1399,13 @@ INDEX_TEMPLATE = """
             </div>
         </header>
 
-        <!-- Search Container (Pinned Below Header) -->
-        <div class="search-container" id="admin-search-container">
+        <!-- SEARCH BAR & STICKY BACK BUTTON ROW -->
+        <div class="sticky-nav-bar" id="admin-search-container">
+            <!-- REQ 1: NON-SCROLLABLE STICKY BACK BUTTON -->
+            <button class="btn-back-sticky" id="global-back-btn" onclick="goBackHome()">
+                <i class="fa-solid fa-arrow-left"></i> Back
+            </button>
+
             <div class="search-wrapper">
                 <i class="fa-solid fa-magnifying-glass"></i>
                 <input type="text" class="search-input" id="global-search-input" 
@@ -1535,7 +1563,6 @@ INDEX_TEMPLATE = """
         <div id="view-overview" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">👛 Wallet Overview</div>
-                <button class="btn-back" onclick="showSection('home')">← Back</button>
             </div>
 
             <div class="overview-box">
@@ -1564,17 +1591,13 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 3: MEMBERS DIRECTORY (REQ 2: DUAL ADD MEMBER BUTTONS) -->
+        <!-- VIEW 3: MEMBERS DIRECTORY -->
         <div id="view-members" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">👥 Members Directory</div>
-                <div style="display: flex; gap: 8px; align-items: center;">
-                    <!-- REQ 2: Top Add Member Button -->
-                    <button class="btn-add-header" onclick="showSection('register')">
-                        <i class="fa-solid fa-user-plus"></i> Add Member
-                    </button>
-                    <button class="btn-back" onclick="showSection('home')">← Back</button>
-                </div>
+                <button class="btn-add-header" onclick="showSection('register')">
+                    <i class="fa-solid fa-user-plus"></i> Add Member
+                </button>
             </div>
 
             <div class="filter-row">
@@ -1583,7 +1606,6 @@ INDEX_TEMPLATE = """
 
             <div id="members-cards-container" class="member-grid-2col"></div>
 
-            <!-- REQ 2: Bottom Add Member Button -->
             <div style="margin-top: 1.25rem;">
                 <button class="btn-submit" onclick="showSection('register')" style="display: flex; align-items: center; justify-content: center; gap: 8px;">
                     <i class="fa-solid fa-user-plus"></i> Add New Member
@@ -1595,7 +1617,6 @@ INDEX_TEMPLATE = """
         <div id="view-savings" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">➕ Record Savings</div>
-                <button class="btn-back" onclick="showSection('home')">← Back</button>
             </div>
             <div class="card-form">
                 <form id="form-add-savings" onsubmit="handleSavingsSubmit(event)">
@@ -1628,7 +1649,6 @@ INDEX_TEMPLATE = """
         <div id="view-withdrawal" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">🏧 Process Withdrawal</div>
-                <button class="btn-back" onclick="showSection('home')">← Back</button>
             </div>
             <div class="card-form">
                 <form id="form-withdrawal" onsubmit="handleWithdrawalSubmit(event)">
@@ -1664,7 +1684,6 @@ INDEX_TEMPLATE = """
         <div id="view-loans" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">💳 Loans Ledger</div>
-                <button class="btn-back" onclick="showSection('home')">← Back</button>
             </div>
 
             <div class="table-responsive">
@@ -1685,11 +1704,10 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 7: DAILY TRACKER (REQ 5: CONSOLIDATED ROW WITH SERVICE FEE COLUMN) -->
+        <!-- VIEW 7: DAILY TRACKER -->
         <div id="view-tracker" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">📊 Daily Tracker</div>
-                <button class="btn-back" onclick="showSection('home')">← Back</button>
             </div>
 
             <div class="filter-row">
@@ -1738,7 +1756,6 @@ INDEX_TEMPLATE = """
         <div id="view-service-fees" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">🏢 Monthly Service Fees</div>
-                <button class="btn-back" onclick="showSection('home')">← Back</button>
             </div>
 
             <div class="filter-row">
@@ -1773,7 +1790,6 @@ INDEX_TEMPLATE = """
         <div id="view-register" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">🆔 Register Member</div>
-                <button class="btn-back" onclick="showSection('home')">← Back</button>
             </div>
             <div class="card-form">
                 <form id="form-register-member" onsubmit="handleMemberRegister(event)">
@@ -1794,7 +1810,6 @@ INDEX_TEMPLATE = """
         <div id="view-manage-members" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">⚙️ Manage Members</div>
-                <button class="btn-back" onclick="showSection('home')">← Back</button>
             </div>
 
             <div class="overview-box" style="margin-bottom: 1.25rem; background: #e0f2fe; border-color: #bae6fd;">
@@ -1823,7 +1838,6 @@ INDEX_TEMPLATE = """
         <div id="view-member-history" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">🔎 Member Contribution History</div>
-                <button class="btn-back" onclick="showSection('home')">← Back</button>
             </div>
 
             <div class="card-form" style="margin-bottom: 1.25rem;">
@@ -1865,7 +1879,6 @@ INDEX_TEMPLATE = """
         <div id="view-past-records" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">📦 Past Records Archive</div>
-                <button class="btn-back" onclick="showSection('home')">← Back</button>
             </div>
 
             <p style="font-size:0.85rem; color:var(--text-muted); margin-bottom:1rem;">
@@ -1897,7 +1910,6 @@ INDEX_TEMPLATE = """
         <div id="view-maintenance" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">🛠️ System Maintenance</div>
-                <button class="btn-back" onclick="showSection('home')">← Back</button>
             </div>
 
             <div class="manage-subcard" style="margin-bottom: 1.25rem;">
@@ -1929,7 +1941,6 @@ INDEX_TEMPLATE = """
         <div id="view-password" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">🔐 Update Password</div>
-                <button class="btn-back" onclick="showSection('home')">← Back</button>
             </div>
             <div class="card-form">
                 <form id="form-password" onsubmit="handlePasswordUpdate(event)">
@@ -1948,7 +1959,7 @@ INDEX_TEMPLATE = """
 
     </div>
 
-    <!-- MEMBER PROFILE MODAL (REQ 5: SHOW TOTAL SERVICE PAID) -->
+    <!-- MEMBER PROFILE MODAL -->
     <div class="modal-overlay" id="member-profile-modal">
         <div class="modal-card">
             <div class="modal-header">
@@ -1974,7 +1985,6 @@ INDEX_TEMPLATE = """
                         <span style="color:var(--text-muted);">Savings Balance:</span>
                         <span style="color:var(--primary-green-dark); font-weight:800;" id="modal-balance">₦0.00</span>
                     </div>
-                    <!-- REQ 5: Display Total Service Fee Paid in Member Modal -->
                     <div class="modal-detail-item">
                         <span style="color:var(--text-muted);">Total Service Fees Paid:</span>
                         <span style="color:var(--amber-fee); font-weight:800;" id="modal-service-fees">₦0.00</span>
@@ -2209,7 +2219,7 @@ INDEX_TEMPLATE = """
                     document.getElementById('header-member-count').innerText = data.total_members || 0;
                     
                     if (data.role === 'admin') {
-                        document.getElementById('admin-search-container').style.display = 'block';
+                        document.getElementById('admin-search-container').style.display = 'flex';
                         document.getElementById('header-member-badge').style.display = 'flex';
                         fetchAndRenderMembers();
                         showSection('home');
@@ -2272,6 +2282,12 @@ INDEX_TEMPLATE = """
             }
         }
 
+        function goBackHome() {
+            if (currentUser && currentUser.role === 'admin') {
+                showSection('home');
+            }
+        }
+
         async function loadMemberPrivatePortal(memberId) {
             const res = await fetch(`/api/member/${memberId}`);
             const data = await res.json();
@@ -2307,12 +2323,20 @@ INDEX_TEMPLATE = """
             }
         }
 
+        /* SHOW / HIDE STICKY BACK BUTTON DEPENDING ON ACTIVE VIEW */
         function showSection(sectionId) {
             document.querySelectorAll('.view-section').forEach(sec => sec.classList.remove('active'));
             const target = document.getElementById(`view-${sectionId}`);
             if (target) {
                 target.classList.add('active');
                 window.scrollTo({ top: 0, behavior: 'smooth' });
+            }
+
+            const backBtn = document.getElementById('global-back-btn');
+            if (sectionId === 'home' || sectionId === 'login' || sectionId === 'member-portal') {
+                backBtn.style.display = 'none';
+            } else {
+                backBtn.style.display = 'inline-flex';
             }
 
             if (sectionId === 'overview') loadOverview();
@@ -2421,7 +2445,7 @@ INDEX_TEMPLATE = """
             document.getElementById('modal-member-name-title').innerText = `${m.full_name} (${m.member_id})`;
             document.getElementById('modal-target').innerText = formatNaira(m.daily_target);
             document.getElementById('modal-balance').innerText = formatNaira(m.net_balance);
-            document.getElementById('modal-service-fees').innerText = formatNaira(m.total_service_fees); // REQ 5
+            document.getElementById('modal-service-fees').innerText = formatNaira(m.total_service_fees);
             document.getElementById('modal-loan').innerText = formatNaira(m.active_loan);
             document.getElementById('modal-cycle-val').innerText = `🔄 Cycle ${m.current_cycle} (${m.cycle_days} / 31 days)`;
 
@@ -2598,7 +2622,6 @@ INDEX_TEMPLATE = """
             document.getElementById('withdrawal-search-dropdown').style.display = 'none';
         }
 
-        /* REQ 4: HISTORY SEARCH & AUTOCOMPLETE */
         function handleHistorySearchInput(e) {
             const query = e.target.value.trim().toLowerCase();
             const dropdown = document.getElementById('history-search-dropdown');
@@ -3033,7 +3056,6 @@ INDEX_TEMPLATE = """
             }
         }
 
-        /* REQ 5: RENDER DAILY TRACKER WITH CONSOLIDATED GROSS & SERVICE FEE COLUMN */
         async function loadTracker() {
             const dateVal = document.getElementById('tracker-date-filter').value;
             const res = await fetch(`/api/tracker/daily?date=${dateVal}`);
