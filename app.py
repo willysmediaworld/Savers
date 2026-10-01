@@ -1,6 +1,6 @@
 import os
 import sqlite3
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from flask import Flask, render_template_string, request, jsonify, g, session
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -134,7 +134,6 @@ def init_db():
             )
         ''')
 
-        # REQ 10: PERMANENT ARCHIVE TABLE FOR LIFETIME TRACKING
         cursor.execute(f'''
             CREATE TABLE IF NOT EXISTS transaction_archives (
                 id {pk_type},
@@ -179,7 +178,6 @@ def init_db():
 with app.app_context():
     init_db()
 
-# Helper function to archive all transactions permanently
 def archive_transaction(member_id, full_name, tx_type, amount, cycle_no, date_str, notes):
     try:
         db = get_db()
@@ -210,7 +208,6 @@ def login():
     cursor = db.cursor()
     p = query_param()
 
-    # 1. Check Admin Account First
     cursor.execute(f"SELECT * FROM admin_users WHERE username = {p}", (username,))
     admin = cursor.fetchone()
     if admin and check_password_hash(admin['password_hash'], password):
@@ -220,7 +217,6 @@ def login():
         session['full_name'] = 'Oladele Rotimi Williams'
         return jsonify({'success': True, 'role': 'admin', 'name': 'Oladele Rotimi Williams', 'member_id': 'SVR0001'})
 
-    # 2. Check Member Accounts
     cursor.execute(f"SELECT * FROM members WHERE username = {p} OR member_id = {p}", (username, username))
     member = cursor.fetchone()
     if member and member['password_hash'] and check_password_hash(member['password_hash'], password):
@@ -295,7 +291,6 @@ def manage_members():
         data = request.json or {}
         full_name = data.get('full_name', '').strip()
         
-        # REQ 6: Daily target optional (default to 500.0 if omitted/blank)
         raw_target = data.get('daily_target')
         try:
             daily_target = float(raw_target) if raw_target not in (None, '', '0') else 500.0
@@ -453,12 +448,12 @@ def member_detail_update_delete(member_id):
                 'total_saved': m['total_saved'],
                 'net_balance': m['total_saved'] - m['total_withdrawn'],
                 'active_loan': m['active_loan'],
-                'total_service_fees': m['total_service_fees'] # REQ 8
+                'total_service_fees': m['total_service_fees']
             },
             'recent_savings': savings
         })
 
-# REQ 9: FULL MEMBER CONTRIBUTION HISTORY
+# REQ 4: FULL MEMBER CONTRIBUTION HISTORY (ACTIVE + ARCHIVES)
 @app.route('/api/member/<member_id>/history', methods=['GET'])
 def get_member_full_history(member_id):
     db = get_db()
@@ -479,8 +474,11 @@ def get_member_full_history(member_id):
         UNION ALL
         SELECT 'Withdrawal' as category, amount, date, notes, 0 as days_credited, created_at 
         FROM withdrawals WHERE member_id = {p}
+        UNION ALL
+        SELECT tx_type as category, amount, date, notes, 0 as days_credited, created_at
+        FROM transaction_archives WHERE member_id = {p}
         ORDER BY date DESC, created_at DESC
-    ''', (member_id,))
+    ''', (member_id, member_id, member_id, member_id))
     
     rows = cursor.fetchall()
     history = [dict(r) for r in rows]
@@ -504,7 +502,6 @@ def reset_single_member_ledger(member_id):
 
     actual_id = m['member_id']
 
-    # Delete active ledgers (Archives remain preserved for past record tracking - REQ 10)
     cursor.execute(f'''
         DELETE FROM loan_repayments 
         WHERE loan_id IN (SELECT id FROM loans WHERE member_id = {p})
@@ -521,7 +518,7 @@ def reset_single_member_ledger(member_id):
     return jsonify({'success': True, 'message': f'Financial data for {m["full_name"]} ({actual_id}) reset successfully!'})
 
 # -----------------------------------------------------------------------------
-# BULK SAVINGS & MULTI-CYCLE FEE LOGIC
+# BULK SAVINGS & MULTI-CYCLE FEE LOGIC (REQ 3: SPREAD SERVICE FEES ACROSS MONTHS)
 # -----------------------------------------------------------------------------
 @app.route('/api/savings', methods=['GET', 'POST'])
 def handle_savings():
@@ -537,7 +534,7 @@ def handle_savings():
         except ValueError:
             deposit_amount = 0.0
 
-        savings_date = data.get('date') or date.today().isoformat()
+        savings_date_str = data.get('date') or date.today().isoformat()
         notes = data.get('notes', '').strip()
 
         if not member_id or deposit_amount <= 0:
@@ -552,7 +549,9 @@ def handle_savings():
         current_cycle = m['current_cycle']
         cycle_days = m['cycle_days']
         daily_target = m['daily_target'] if m['daily_target'] > 0 else 500.0
-        month_year = datetime.strptime(savings_date, '%Y-%m-%d').strftime('%Y-%m')
+
+        base_date = datetime.strptime(savings_date_str, '%Y-%m-%d')
+        accumulated_days = 0
 
         remaining_cash = deposit_amount
         total_fees_collected = 0.0
@@ -566,9 +565,16 @@ def handle_savings():
                 remaining_cash -= fee_deducted
                 total_fees_collected += fee_deducted
 
+                # REQ 3: Calculate spread date for fee across concerned month
+                target_fee_date = base_date + timedelta(days=accumulated_days)
+                fee_date_fmt = target_fee_date.strftime('%Y-%m-%d')
+                fee_month_fmt = target_fee_date.strftime('%Y-%m')
+
                 fee_records.append({
                     'amount': fee_deducted,
                     'cycle': current_cycle,
+                    'date': fee_date_fmt,
+                    'month_year': fee_month_fmt,
                     'desc': f'Cycle {current_cycle} Service Fee'
                 })
 
@@ -587,6 +593,7 @@ def handle_savings():
                 total_savings_credited += cash_spent
                 total_days_added += days_bought
                 cycle_days += days_bought
+                accumulated_days += days_bought
 
             if days_bought == 0 and remaining_cash < daily_target and cycle_days > 0:
                 break
@@ -595,29 +602,29 @@ def handle_savings():
                 current_cycle += 1
                 cycle_days = 0
 
+        # INSERT EXTRACTED SERVICE FEE RECORDS WITH CONCERNED SPREAD DATES
         for f in fee_records:
             cursor.execute(f'''
                 INSERT INTO savings (member_id, amount, date, month_year, is_service_fee, days_credited, notes)
                 VALUES ({p}, {p}, {p}, {p}, 1, 0, {p})
-            ''', (member_id, f['amount'], savings_date, month_year, f['desc']))
+            ''', (member_id, f['amount'], f['date'], f['month_year'], f['desc']))
 
             cursor.execute(f'''
                 INSERT INTO service_fees (member_id, amount, month_year, description, date)
                 VALUES ({p}, {p}, {p}, {p}, {p})
-            ''', (member_id, f['amount'], month_year, f['desc'], savings_date))
+            ''', (member_id, f['amount'], f['month_year'], f['desc'], f['date']))
 
-            # REQ 10: Permanent Archive
-            archive_transaction(member_id, full_name, 'Service Fee', f['amount'], f['cycle'], savings_date, f['desc'])
+            archive_transaction(member_id, full_name, 'Service Fee', f['amount'], f['cycle'], f['date'], f['desc'])
 
         if total_savings_credited > 0:
             savings_note = notes or f'Bulk Contribution ({total_days_added} days)'
+            month_year_base = base_date.strftime('%Y-%m')
             cursor.execute(f'''
                 INSERT INTO savings (member_id, amount, date, month_year, is_service_fee, days_credited, notes)
                 VALUES ({p}, {p}, {p}, {p}, 0, {p}, {p})
-            ''', (member_id, total_savings_credited, savings_date, month_year, total_days_added, savings_note))
+            ''', (member_id, total_savings_credited, savings_date_str, month_year_base, total_days_added, savings_note))
 
-            # REQ 10: Permanent Archive
-            archive_transaction(member_id, full_name, 'Savings', total_savings_credited, current_cycle, savings_date, savings_note)
+            archive_transaction(member_id, full_name, 'Savings', total_savings_credited, current_cycle, savings_date_str, savings_note)
 
         cursor.execute(f'UPDATE members SET current_cycle = {p}, cycle_days = {p} WHERE member_id = {p}', 
                        (current_cycle, cycle_days, member_id))
@@ -713,7 +720,6 @@ def process_withdrawal():
         VALUES ({p}, {p}, {p}, 0.0, {p}, {p})
     ''', (member_id, amount, withdrawal_type, w_date, notes))
 
-    # REQ 10: Permanent Archive
     archive_transaction(member_id, m_info['full_name'], 'Withdrawal', amount, m_info['current_cycle'], w_date, notes or f'{withdrawal_type} Payout')
 
     if withdrawal_type == 'reset':
@@ -756,7 +762,6 @@ def handle_loans():
             VALUES ({p}, {p}, 0.0, {p}, {p})
         ''', (member_id, amount, amount, issue_date))
 
-        # REQ 10: Permanent Archive
         if m_info:
             archive_transaction(member_id, m_info['full_name'], 'Loan Disbursed', amount, m_info['current_cycle'], issue_date, 'Loan Issued')
 
@@ -804,14 +809,13 @@ def repay_loan():
                    (loan_id, amount, repay_date, notes))
     cursor.execute(f'UPDATE loans SET amount_paid = {p}, status = {p} WHERE id = {p}', (new_paid, status, loan_id))
 
-    # REQ 10: Permanent Archive
     archive_transaction(loan['member_id'], loan['full_name'], 'Loan Repayment', amount, loan['current_cycle'], repay_date, notes)
 
     db.commit()
     return jsonify({'success': True, 'message': 'Loan repayment recorded!'})
 
 # -----------------------------------------------------------------------------
-# DAILY TRACKER & SERVICE FEES (REQ 3 & 4: DATE / MONTH FILTERS)
+# DAILY TRACKER (REQ 5: CONSOLIDATE GROSS INFLOW & SERVICE FEE COLUMN)
 # -----------------------------------------------------------------------------
 @app.route('/api/tracker/daily', methods=['GET'])
 def get_daily_tracker():
@@ -819,47 +823,93 @@ def get_daily_tracker():
     cursor = db.cursor()
     p = query_param()
 
-    selected_date = request.args.get('date', '').strip() # REQ 3 Filter
+    selected_date = request.args.get('date', '').strip()
 
-    where_savings = f"WHERE s.is_service_fee = 0 AND s.date = {p}" if selected_date else "WHERE s.is_service_fee = 0"
-    where_fees = f"WHERE f.date = {p}" if selected_date else ""
+    where_savings = f"WHERE s.date = {p}" if selected_date else ""
     where_repay = f"WHERE lr.date = {p}" if selected_date else ""
     where_withdraw = f"WHERE w.date = {p}" if selected_date else ""
     where_loans = f"WHERE l.issue_date = {p}" if selected_date else ""
 
     params = []
     if selected_date:
-        params = [selected_date] * 5
+        params = [selected_date] * 4
 
     query = f'''
-        SELECT 'Savings Contribution' as tx_type, s.date, s.member_id, m.full_name, s.amount as inflow, 0.0 as outflow, COALESCE(s.notes, 'Savings Deposit') as notes, s.created_at, s.id
+        SELECT 'Savings Deposit' as tx_type, s.date, s.member_id, m.full_name, 
+               s.amount as net_amount, s.is_service_fee, COALESCE(s.notes, 'Deposit') as notes, s.created_at, s.id
         FROM savings s JOIN members m ON s.member_id = m.member_id {where_savings}
         UNION ALL
-        SELECT 'Service Fee' as tx_type, f.date, f.member_id, m.full_name, f.amount as inflow, 0.0 as outflow, COALESCE(f.description, 'Service Fee') as notes, f.created_at, f.id
-        FROM service_fees f JOIN members m ON f.member_id = m.member_id {where_fees}
-        UNION ALL
-        SELECT 'Loan Repayment' as tx_type, lr.date, l.member_id, m.full_name, lr.amount as inflow, 0.0 as outflow, COALESCE(lr.notes, 'Loan Repayment') as notes, lr.created_at, lr.id
+        SELECT 'Loan Repayment' as tx_type, lr.date, l.member_id, m.full_name, 
+               lr.amount as net_amount, 0 as is_service_fee, COALESCE(lr.notes, 'Loan Repayment') as notes, lr.created_at, lr.id
         FROM loan_repayments lr JOIN loans l ON lr.loan_id = l.id JOIN members m ON l.member_id = m.member_id {where_repay}
         UNION ALL
-        SELECT 'Withdrawal Payout' as tx_type, w.date, w.member_id, m.full_name, 0.0 as inflow, w.amount as outflow, COALESCE(w.notes, 'Member Withdrawal') as notes, w.created_at, w.id
+        SELECT 'Withdrawal Payout' as tx_type, w.date, w.member_id, m.full_name, 
+               w.amount as net_amount, 0 as is_service_fee, COALESCE(w.notes, 'Member Withdrawal') as notes, w.created_at, w.id
         FROM withdrawals w JOIN members m ON w.member_id = m.member_id {where_withdraw}
         UNION ALL
-        SELECT 'Loan Disbursement' as tx_type, l.issue_date as date, l.member_id, m.full_name, 0.0 as inflow, l.amount as outflow, 'Loan Disbursed' as notes, l.created_at, l.id
+        SELECT 'Loan Disbursement' as tx_type, l.issue_date as date, l.member_id, m.full_name, 
+               l.amount as net_amount, 0 as is_service_fee, 'Loan Disbursed' as notes, l.created_at, l.id
         FROM loans l JOIN members m ON l.member_id = m.member_id {where_loans}
         ORDER BY date DESC, id DESC
     '''
     
     cursor.execute(query, tuple(params))
     rows = cursor.fetchall()
-    logs = [dict(r) for r in rows]
 
-    total_inflow = sum(r['inflow'] for r in logs)
+    # REQ 5: Aggregate bulk savings so Gross Inflow and Service Fee are in one row
+    logs = []
+    grouped_savings = {}
+
+    for r in rows:
+        dict_r = dict(r)
+        if dict_r['tx_type'] == 'Savings Deposit':
+            key = f"{dict_r['member_id']}_{dict_r['date']}_{dict_r['created_at']}"
+            if key not in grouped_savings:
+                grouped_savings[key] = {
+                    'tx_type': 'Savings Deposit',
+                    'date': dict_r['date'],
+                    'member_id': dict_r['member_id'],
+                    'full_name': dict_r['full_name'],
+                    'gross_inflow': 0.0,
+                    'service_fee': 0.0,
+                    'outflow': 0.0,
+                    'notes': dict_r['notes']
+                }
+            
+            if dict_r['is_service_fee'] == 1:
+                grouped_savings[key]['service_fee'] += dict_r['net_amount']
+            else:
+                grouped_savings[key]['gross_inflow'] += dict_r['net_amount']
+                grouped_savings[key]['notes'] = dict_r['notes']
+        else:
+            is_outflow = dict_r['tx_type'] in ('Withdrawal Payout', 'Loan Disbursement')
+            logs.append({
+                'tx_type': dict_r['tx_type'],
+                'date': dict_r['date'],
+                'member_id': dict_r['member_id'],
+                'full_name': dict_r['full_name'],
+                'gross_inflow': 0.0 if is_outflow else dict_r['net_amount'],
+                'service_fee': 0.0,
+                'outflow': dict_r['net_amount'] if is_outflow else 0.0,
+                'notes': dict_r['notes']
+            })
+
+    # Add grouped deposit items
+    for k, grp in grouped_savings.items():
+        grp['gross_inflow'] += grp['service_fee'] # Total deposit gross
+        logs.append(grp)
+
+    logs.sort(key=lambda x: x['date'], reverse=True)
+
+    total_inflow = sum(r['gross_inflow'] for r in logs)
+    total_service_fees = sum(r['service_fee'] for r in logs)
     total_outflow = sum(r['outflow'] for r in logs)
     net_cashflow = total_inflow - total_outflow
 
     return jsonify({
         'logs': logs,
         'total_inflow': total_inflow,
+        'total_service_fees': total_service_fees,
         'total_outflow': total_outflow,
         'net_cashflow': net_cashflow,
         'selected_date': selected_date
@@ -871,7 +921,7 @@ def get_service_fees():
     cursor = db.cursor()
     p = query_param()
 
-    selected_month = request.args.get('month', '').strip() # REQ 4 Filter
+    selected_month = request.args.get('month', '').strip()
 
     if selected_month:
         cursor.execute(f'''
@@ -899,7 +949,6 @@ def get_service_fees():
         'selected_month': selected_month
     })
 
-# REQ 10: PAST RECORDS & ARCHIVE LEDGER API
 @app.route('/api/archives', methods=['GET'])
 def get_past_records():
     db = get_db()
@@ -1016,12 +1065,19 @@ INDEX_TEMPLATE = """
         .toast.error { background: var(--primary-red); }
         @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
 
-        /* Header */
-        header {
-            background: #ffffff; padding: 0.85rem 1rem;
-            display: flex; justify-content: space-between; align-items: center;
+        /* REQ 1: STICKY TOP WRAPPER (HEADER + SEARCH BAR DO NOT SCROLL) */
+        .sticky-header-container {
+            position: sticky;
+            top: 0;
+            z-index: 500;
+            background: #ffffff;
             border-bottom: 1.5px solid var(--border-light);
-            position: sticky; top: 0; z-index: 100;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.03);
+        }
+
+        header {
+            padding: 0.85rem 1rem;
+            display: flex; justify-content: space-between; align-items: center;
         }
         header .brand-box { display: flex; align-items: center; gap: 10px; cursor: pointer; }
         header .sprout-icon {
@@ -1031,7 +1087,6 @@ INDEX_TEMPLATE = """
         }
         header .brand-title { font-size: 1.25rem; font-weight: 800; color: var(--text-dark); letter-spacing: -0.3px; }
         
-        /* REQ 1: Header Member Count Badge */
         .header-controls { display: flex; align-items: center; gap: 10px; }
         .member-count-badge {
             background: #f1f5f9; border: 1.5px solid var(--border-light);
@@ -1045,8 +1100,7 @@ INDEX_TEMPLATE = """
             cursor: pointer; min-height: 36px;
         }
 
-        /* Search Bar */
-        .search-container { padding: 0.85rem 1rem 0.4rem 1rem; max-width: 600px; margin: 0 auto; width: 100%; position: relative; }
+        .search-container { padding: 0.4rem 1rem 0.85rem 1rem; max-width: 600px; margin: 0 auto; width: 100%; position: relative; }
         .search-wrapper { position: relative; width: 100%; }
         .search-wrapper i { position: absolute; left: 16px; top: 50%; transform: translateY(-50%); color: #94a3b8; font-size: 0.95rem; }
         .search-input {
@@ -1056,7 +1110,7 @@ INDEX_TEMPLATE = """
         .search-results-dropdown {
             position: absolute; top: 100%; left: 0; right: 0; background: #ffffff;
             border: 1.5px solid var(--border-light); border-radius: 16px; box-shadow: 0 10px 25px rgba(0,0,0,0.1);
-            z-index: 500; max-height: 240px; overflow-y: auto; display: none; margin-top: 4px;
+            z-index: 600; max-height: 240px; overflow-y: auto; display: none; margin-top: 4px;
         }
         .search-result-item {
             padding: 12px 16px; border-bottom: 1px solid var(--border-light); cursor: pointer;
@@ -1064,7 +1118,7 @@ INDEX_TEMPLATE = """
         }
         .search-result-item:hover { background: #f8fafc; }
 
-        .app-container { max-width: 600px; margin: 0 auto; width: 100%; padding: 0.5rem 1rem 2rem 1rem; flex: 1; }
+        .app-container { max-width: 600px; margin: 0 auto; width: 100%; padding: 1rem 1rem 2rem 1rem; flex: 1; }
 
         .view-section { display: none; }
         .view-section.active { display: block; animation: fadeIn 0.2s forwards; }
@@ -1082,7 +1136,6 @@ INDEX_TEMPLATE = """
             display: flex; align-items: center; gap: 6px;
         }
 
-        /* Login Screen Card */
         .login-card {
             background: #ffffff; border: 1.5px solid var(--border-light);
             border-radius: 20px; padding: 1.75rem 1.25rem; max-width: 420px; margin: 2rem auto;
@@ -1096,7 +1149,6 @@ INDEX_TEMPLATE = """
         }
         .login-header h2 { font-size: 1.35rem; font-weight: 800; color: var(--text-dark); }
 
-        /* 3-COLUMN HOMEPAGE GRID */
         .grid-3-col {
             display: grid;
             grid-template-columns: repeat(3, 1fr);
@@ -1176,7 +1228,6 @@ INDEX_TEMPLATE = """
         .filter-row { display: flex; gap: 8px; margin-bottom: 1rem; }
         .filter-row input, .filter-row select { flex: 1; padding: 10px 14px; border-radius: 12px; border: 1.5px solid var(--border-light); font-size: 0.88rem; background: #fff; }
 
-        /* REQ 5: 2-COLUMN COMPACT MEMBER DIRECTORY GRID */
         .member-grid-2col {
             display: grid;
             grid-template-columns: 1fr 1fr;
@@ -1211,7 +1262,6 @@ INDEX_TEMPLATE = """
             display: flex; align-items: center; justify-content: center; gap: 4px;
         }
 
-        /* Modals */
         .modal-overlay {
             position: fixed; top: 0; left: 0; right: 0; bottom: 0;
             background: rgba(15, 23, 42, 0.6); backdrop-filter: blur(3px);
@@ -1309,31 +1359,33 @@ INDEX_TEMPLATE = """
 
     <div id="toast-container"></div>
 
-    <header>
-        <div class="brand-box" onclick="handleHeaderClick()">
-            <div class="sprout-icon"><i class="fa-solid fa-leaf"></i></div>
-            <div class="brand-title">Savers Growth</div>
-        </div>
-        <div class="header-controls">
-            <!-- REQ 1: Total Members Count Display -->
-            <div class="member-count-badge" id="header-member-badge">
-                <i class="fa-solid fa-users"></i> <span id="header-member-count">0</span>
+    <!-- REQ 1: STICKY TOP CONTAINER (HEADER + SEARCH BAR STAYS AT TOP) -->
+    <div class="sticky-header-container">
+        <header>
+            <div class="brand-box" onclick="handleHeaderClick()">
+                <div class="sprout-icon"><i class="fa-solid fa-leaf"></i></div>
+                <div class="brand-title">Savers Growth</div>
             </div>
-            <button class="btn-logout" id="header-auth-btn" onclick="handleAuthAction()">
-                Logout
-            </button>
-        </div>
-    </header>
+            <div class="header-controls">
+                <div class="member-count-badge" id="header-member-badge">
+                    <i class="fa-solid fa-users"></i> <span id="header-member-count">0</span>
+                </div>
+                <button class="btn-logout" id="header-auth-btn" onclick="handleAuthAction()">
+                    Logout
+                </button>
+            </div>
+        </header>
 
-    <!-- Search Container (Admin Only Header Search) -->
-    <div class="search-container" id="admin-search-container">
-        <div class="search-wrapper">
-            <i class="fa-solid fa-magnifying-glass"></i>
-            <input type="text" class="search-input" id="global-search-input" 
-                   placeholder="Type member ID or digits (e.g. 01)..." 
-                   oninput="handleGlobalSearchInput(event)">
+        <!-- Search Container (Pinned Below Header) -->
+        <div class="search-container" id="admin-search-container">
+            <div class="search-wrapper">
+                <i class="fa-solid fa-magnifying-glass"></i>
+                <input type="text" class="search-input" id="global-search-input" 
+                       placeholder="Type member ID or digits (e.g. 01)..." 
+                       oninput="handleGlobalSearchInput(event)">
+            </div>
+            <div class="search-results-dropdown" id="search-results-dropdown"></div>
         </div>
-        <div class="search-results-dropdown" id="search-results-dropdown"></div>
     </div>
 
     <div class="app-container">
@@ -1410,13 +1462,11 @@ INDEX_TEMPLATE = """
             </div>
 
             <div class="grid-row-4-center">
-                <!-- REQ 9: Search Member Contribution History Card -->
                 <div class="menu-card" onclick="showSection('member-history')">
                     <div class="icon-badge mint">🔎</div>
                     <div class="card-heading">Member History</div>
                 </div>
 
-                <!-- REQ 10: Past Records Archive Card -->
                 <div class="menu-card" onclick="showSection('past-records')">
                     <div class="icon-badge pink">📦</div>
                     <div class="card-heading">Past Records</div>
@@ -1449,7 +1499,6 @@ INDEX_TEMPLATE = """
                         <span>Daily Target:</span>
                         <span id="mportal-target" style="font-weight: 800;">₦0.00</span>
                     </div>
-                    <!-- REQ 8: Display Service Fees Paid -->
                     <div class="overview-row">
                         <span>Service Fees Paid:</span>
                         <span id="mportal-fees" style="font-weight: 800; color: var(--amber-fee);">₦0.00</span>
@@ -1515,11 +1564,17 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 3: MEMBERS DIRECTORY (REQ 5: 2-COLUMN COMPACT GRID & BOTTOM ADD BUTTON) -->
+        <!-- VIEW 3: MEMBERS DIRECTORY (REQ 2: DUAL ADD MEMBER BUTTONS) -->
         <div id="view-members" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">👥 Members Directory</div>
-                <button class="btn-back" onclick="showSection('home')">← Back</button>
+                <div style="display: flex; gap: 8px; align-items: center;">
+                    <!-- REQ 2: Top Add Member Button -->
+                    <button class="btn-add-header" onclick="showSection('register')">
+                        <i class="fa-solid fa-user-plus"></i> Add Member
+                    </button>
+                    <button class="btn-back" onclick="showSection('home')">← Back</button>
+                </div>
             </div>
 
             <div class="filter-row">
@@ -1528,7 +1583,7 @@ INDEX_TEMPLATE = """
 
             <div id="members-cards-container" class="member-grid-2col"></div>
 
-            <!-- REQ 5: Add Member Button at the Bottom -->
+            <!-- REQ 2: Bottom Add Member Button -->
             <div style="margin-top: 1.25rem;">
                 <button class="btn-submit" onclick="showSection('register')" style="display: flex; align-items: center; justify-content: center; gap: 8px;">
                     <i class="fa-solid fa-user-plus"></i> Add New Member
@@ -1569,7 +1624,7 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 5: PROCESS WITHDRAWAL (REQ 2: 2-DIGIT SEARCH MEMBER AUTOCOMPLETE) -->
+        <!-- VIEW 5: PROCESS WITHDRAWAL -->
         <div id="view-withdrawal" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">🏧 Process Withdrawal</div>
@@ -1630,14 +1685,13 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 7: DAILY TRACKER (REQ 3: DATE PICKER FILTER) -->
+        <!-- VIEW 7: DAILY TRACKER (REQ 5: CONSOLIDATED ROW WITH SERVICE FEE COLUMN) -->
         <div id="view-tracker" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">📊 Daily Tracker</div>
                 <button class="btn-back" onclick="showSection('home')">← Back</button>
             </div>
 
-            <!-- REQ 3: Calendar Date Filter -->
             <div class="filter-row">
                 <input type="date" id="tracker-date-filter" onchange="loadTracker()">
                 <button class="btn-back" onclick="clearTrackerDateFilter()">Show All Days</button>
@@ -1645,16 +1699,20 @@ INDEX_TEMPLATE = """
 
             <div class="overview-box" style="margin-bottom: 1.25rem;">
                 <div class="overview-row">
-                    <span>Total Inflows:</span>
+                    <span>Total Gross Inflows:</span>
                     <span class="amount-saved" id="tracker-summary-inflow">₦0.00</span>
                 </div>
                 <div class="overview-row">
+                    <span>Total Service Fees:</span>
+                    <span class="amount-fees" id="tracker-summary-fees">₦0.00</span>
+                </div>
+                <div class="overview-row">
                     <span>Total Outflows:</span>
-                    <span class="amount-fees" id="tracker-summary-outflow" style="color:var(--primary-red);">₦0.00</span>
+                    <span style="color:var(--primary-red); font-weight:800;" id="tracker-summary-outflow">₦0.00</span>
                 </div>
                 <div class="overview-divider"></div>
                 <div class="overview-row">
-                    <span>Net Cashflow:</span>
+                    <span>Net Daily Cashflow:</span>
                     <span class="amount-net" id="tracker-summary-net">₦0.00</span>
                 </div>
             </div>
@@ -1665,9 +1723,10 @@ INDEX_TEMPLATE = """
                         <tr>
                             <th>Date</th>
                             <th>Member</th>
-                            <th>Inflow (₦)</th>
+                            <th>Gross Inflow (₦)</th>
+                            <th>Service Fee (₦)</th>
                             <th>Outflow (₦)</th>
-                            <th>Notes</th>
+                            <th>Type & Notes</th>
                         </tr>
                     </thead>
                     <tbody id="tracker-table-body"></tbody>
@@ -1675,14 +1734,13 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 8: MONTHLY SERVICE FEES (REQ 4: MONTH SELECTOR FILTER) -->
+        <!-- VIEW 8: MONTHLY SERVICE FEES -->
         <div id="view-service-fees" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">🏢 Monthly Service Fees</div>
                 <button class="btn-back" onclick="showSection('home')">← Back</button>
             </div>
 
-            <!-- REQ 4: Month Dropdown / Month Picker Filter -->
             <div class="filter-row">
                 <input type="month" id="fees-month-filter" onchange="loadServiceFees()">
                 <button class="btn-back" onclick="clearFeesMonthFilter()">Show All Months</button>
@@ -1711,7 +1769,7 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 9: REGISTER MEMBER (REQ 6: DAILY TARGET OPTIONAL) -->
+        <!-- VIEW 9: REGISTER MEMBER -->
         <div id="view-register" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">🆔 Register Member</div>
@@ -1723,7 +1781,6 @@ INDEX_TEMPLATE = """
                         <label>Full Name</label>
                         <input type="text" class="form-control" id="reg-fullname" placeholder="e.g. Sunday Adebayo" required>
                     </div>
-                    <!-- REQ 6: Daily Target Field Optional -->
                     <div class="form-group">
                         <label>Daily Target Amount (₦) <span style="font-weight:400; color:var(--text-muted);">(Optional - Default: ₦500)</span></label>
                         <input type="number" step="0.01" class="form-control" id="reg-target" placeholder="e.g. 1000">
@@ -1733,14 +1790,13 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 10: MANAGE MEMBERS (REQ 7: SUM UP TOTAL DAILY TARGET) -->
+        <!-- VIEW 10: MANAGE MEMBERS -->
         <div id="view-manage-members" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">⚙️ Manage Members</div>
                 <button class="btn-back" onclick="showSection('home')">← Back</button>
             </div>
 
-            <!-- REQ 7: Sum Total Daily Target Box -->
             <div class="overview-box" style="margin-bottom: 1.25rem; background: #e0f2fe; border-color: #bae6fd;">
                 <div class="overview-row">
                     <span style="color: #0369a1; font-weight:800;">Total System Daily Target Sum:</span>
@@ -1763,7 +1819,7 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- REQ 9: SEARCH MEMBER CONTRIBUTION HISTORY VIEW -->
+        <!-- MEMBER CONTRIBUTION HISTORY VIEW -->
         <div id="view-member-history" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">🔎 Member Contribution History</div>
@@ -1805,7 +1861,7 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- REQ 10: PAST RECORDS ARCHIVE VIEW -->
+        <!-- PAST RECORDS ARCHIVE VIEW -->
         <div id="view-past-records" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">📦 Past Records Archive</div>
@@ -1892,7 +1948,7 @@ INDEX_TEMPLATE = """
 
     </div>
 
-    <!-- MEMBER PROFILE MODAL -->
+    <!-- MEMBER PROFILE MODAL (REQ 5: SHOW TOTAL SERVICE PAID) -->
     <div class="modal-overlay" id="member-profile-modal">
         <div class="modal-card">
             <div class="modal-header">
@@ -1917,6 +1973,11 @@ INDEX_TEMPLATE = """
                     <div class="modal-detail-item">
                         <span style="color:var(--text-muted);">Savings Balance:</span>
                         <span style="color:var(--primary-green-dark); font-weight:800;" id="modal-balance">₦0.00</span>
+                    </div>
+                    <!-- REQ 5: Display Total Service Fee Paid in Member Modal -->
+                    <div class="modal-detail-item">
+                        <span style="color:var(--text-muted);">Total Service Fees Paid:</span>
+                        <span style="color:var(--amber-fee); font-weight:800;" id="modal-service-fees">₦0.00</span>
                     </div>
                     <div class="modal-detail-item">
                         <span style="color:var(--text-muted);">Active Loan:</span>
@@ -2145,7 +2206,7 @@ INDEX_TEMPLATE = """
                 if (data.logged_in) {
                     currentUser = data;
                     document.getElementById('header-auth-btn').innerText = 'Logout';
-                    document.getElementById('header-member-count').innerText = data.total_members || 0; // REQ 1
+                    document.getElementById('header-member-count').innerText = data.total_members || 0;
                     
                     if (data.role === 'admin') {
                         document.getElementById('admin-search-container').style.display = 'block';
@@ -2221,7 +2282,7 @@ INDEX_TEMPLATE = """
                 document.getElementById('mportal-id').innerText = `ID: ${m.member_id}`;
                 document.getElementById('mportal-balance').innerText = formatNaira(m.net_balance);
                 document.getElementById('mportal-target').innerText = formatNaira(m.daily_target);
-                document.getElementById('mportal-fees').innerText = formatNaira(m.total_service_fees); // REQ 8
+                document.getElementById('mportal-fees').innerText = formatNaira(m.total_service_fees);
                 document.getElementById('mportal-loan').innerText = formatNaira(m.active_loan);
                 document.getElementById('mportal-cycle').innerText = `🔄 Cycle ${m.current_cycle} (${m.cycle_days} / 31 days)`;
 
@@ -2260,7 +2321,7 @@ INDEX_TEMPLATE = """
             if (sectionId === 'loans') loadLoans();
             if (sectionId === 'tracker') loadTracker();
             if (sectionId === 'service-fees') loadServiceFees();
-            if (sectionId === 'past-records') loadPastRecords(); // REQ 10
+            if (sectionId === 'past-records') loadPastRecords();
         }
 
         async function fetchAndRenderMembers() {
@@ -2268,7 +2329,6 @@ INDEX_TEMPLATE = """
                 const res = await fetch('/api/members');
                 globalMembers = await res.json();
 
-                // Update Header Member Count (REQ 1)
                 document.getElementById('header-member-count').innerText = globalMembers.length;
 
                 renderMembersDirectory();
@@ -2277,7 +2337,6 @@ INDEX_TEMPLATE = """
             }
         }
 
-        /* REQ 5: COMPACT 2-COLUMN MEMBER DIRECTORY RENDER */
         function renderMembersDirectory() {
             const container = document.getElementById('members-cards-container');
             const searchVal = document.getElementById('member-search-dir').value.toLowerCase();
@@ -2317,7 +2376,6 @@ INDEX_TEMPLATE = """
             });
         }
 
-        /* REQ 7: MANAGE MEMBERS + SUM TOTAL DAILY TARGET */
         function renderManageMembersTable() {
             const tbody = document.getElementById('manage-members-table-body');
             tbody.innerHTML = '';
@@ -2345,7 +2403,6 @@ INDEX_TEMPLATE = """
                 `;
             });
 
-            // Display total sum (REQ 7)
             document.getElementById('manage-total-daily-target').innerText = formatNaira(sumDailyTarget);
         }
 
@@ -2364,6 +2421,7 @@ INDEX_TEMPLATE = """
             document.getElementById('modal-member-name-title').innerText = `${m.full_name} (${m.member_id})`;
             document.getElementById('modal-target').innerText = formatNaira(m.daily_target);
             document.getElementById('modal-balance').innerText = formatNaira(m.net_balance);
+            document.getElementById('modal-service-fees').innerText = formatNaira(m.total_service_fees); // REQ 5
             document.getElementById('modal-loan').innerText = formatNaira(m.active_loan);
             document.getElementById('modal-cycle-val').innerText = `🔄 Cycle ${m.current_cycle} (${m.cycle_days} / 31 days)`;
 
@@ -2454,9 +2512,6 @@ INDEX_TEMPLATE = """
             openMemberModal(memberId);
         }
 
-        /* -------------------------------------------------------------------------
-           RECORD SAVINGS: SEARCH INPUT
-        ------------------------------------------------------------------------- */
         function handleSavingsSearchInput(e) {
             const query = e.target.value.trim().toLowerCase();
             const dropdown = document.getElementById('savings-search-dropdown');
@@ -2500,9 +2555,6 @@ INDEX_TEMPLATE = """
             document.getElementById('savings-search-dropdown').style.display = 'none';
         }
 
-        /* -------------------------------------------------------------------------
-           REQ 2: PROCESS WITHDRAWAL 2-DIGIT SEARCH MEMBER AUTOCOMPLETE
-        ------------------------------------------------------------------------- */
         function handleWithdrawalSearchInput(e) {
             const query = e.target.value.trim().toLowerCase();
             const dropdown = document.getElementById('withdrawal-search-dropdown');
@@ -2546,9 +2598,7 @@ INDEX_TEMPLATE = """
             document.getElementById('withdrawal-search-dropdown').style.display = 'none';
         }
 
-        /* -------------------------------------------------------------------------
-           REQ 9: MEMBER HISTORY SEARCH AUTOCOMPLETE
-        ------------------------------------------------------------------------- */
+        /* REQ 4: HISTORY SEARCH & AUTOCOMPLETE */
         function handleHistorySearchInput(e) {
             const query = e.target.value.trim().toLowerCase();
             const dropdown = document.getElementById('history-search-dropdown');
@@ -2566,7 +2616,6 @@ INDEX_TEMPLATE = """
                 if (matches.length > 0) {
                     dropdown.style.display = 'block';
                     matches.forEach(m => {
-                        const safeName = m.full_name.replace(/'/g, "\\'");
                         dropdown.innerHTML += `
                             <div class="search-result-item" onclick="loadMemberContributionHistory('${m.member_id}')">
                                 <div>
@@ -2620,9 +2669,6 @@ INDEX_TEMPLATE = """
             }
         }
 
-        /* -------------------------------------------------------------------------
-           REQ 10: PAST RECORDS ARCHIVE AUDIT TRAIL
-        ------------------------------------------------------------------------- */
         async function loadPastRecords() {
             const res = await fetch('/api/archives');
             globalArchiveLogs = await res.json();
@@ -2868,7 +2914,6 @@ INDEX_TEMPLATE = """
             }
         }
 
-        /* REQ 2: PROCESS WITHDRAWAL SUBMIT */
         async function handleWithdrawalSubmit(e) {
             e.preventDefault();
             const memberId = document.getElementById('withdrawal-member-id').value;
@@ -2904,7 +2949,6 @@ INDEX_TEMPLATE = """
             }
         }
 
-        /* REQ 6: REGISTER MEMBER SUBMIT */
         async function handleMemberRegister(e) {
             e.preventDefault();
             const payload = {
@@ -2989,13 +3033,14 @@ INDEX_TEMPLATE = """
             }
         }
 
-        /* REQ 3: LOAD DAILY TRACKER WITH DATE FILTER */
+        /* REQ 5: RENDER DAILY TRACKER WITH CONSOLIDATED GROSS & SERVICE FEE COLUMN */
         async function loadTracker() {
             const dateVal = document.getElementById('tracker-date-filter').value;
             const res = await fetch(`/api/tracker/daily?date=${dateVal}`);
             const data = await res.json();
 
             document.getElementById('tracker-summary-inflow').innerText = formatNaira(data.total_inflow);
+            document.getElementById('tracker-summary-fees').innerText = formatNaira(data.total_service_fees);
             document.getElementById('tracker-summary-outflow').innerText = formatNaira(data.total_outflow);
             document.getElementById('tracker-summary-net').innerText = formatNaira(data.net_cashflow);
 
@@ -3003,18 +3048,19 @@ INDEX_TEMPLATE = """
             tbody.innerHTML = '';
 
             if (data.logs.length === 0) {
-                tbody.innerHTML = `<tr><td colspan="5" style="text-align:center; color:var(--text-muted); padding:1.5rem;">No activity recorded for ${dateVal || 'all dates'}.</td></tr>`;
+                tbody.innerHTML = `<tr><td colspan="6" style="text-align:center; color:var(--text-muted); padding:1.5rem;">No activity recorded for ${dateVal || 'all dates'}.</td></tr>`;
                 return;
             }
 
             data.logs.forEach(r => {
-                const isInflow = r.inflow > 0;
+                const isInflow = r.gross_inflow > 0;
                 tbody.innerHTML += `
                     <tr>
                         <td><strong>${r.date}</strong></td>
                         <td>${r.full_name} <br><span style="font-size:0.75rem; color:var(--text-muted);">${r.member_id}</span></td>
-                        <td style="color:var(--primary-green-dark); font-weight:700;">${r.inflow > 0 ? '+ ' + formatNaira(r.inflow) : '-'}</td>
-                        <td style="color:var(--primary-red); font-weight:700;">${r.outflow > 0 ? '- ' + formatNaira(r.outflow) : '-'}</td>
+                        <td style="color:var(--primary-green-dark); font-weight:800;">${r.gross_inflow > 0 ? '+ ' + formatNaira(r.gross_inflow) : '-'}</td>
+                        <td style="color:var(--amber-fee); font-weight:800;">${r.service_fee > 0 ? formatNaira(r.service_fee) : '-'}</td>
+                        <td style="color:var(--primary-red); font-weight:800;">${r.outflow > 0 ? '- ' + formatNaira(r.outflow) : '-'}</td>
                         <td>
                             <span class="badge ${isInflow ? 'badge-savings' : 'badge-payout'}">${r.tx_type}</span>
                             <div style="font-size:0.75rem; color:var(--text-muted); margin-top:2px;">${r.notes || ''}</div>
@@ -3029,7 +3075,6 @@ INDEX_TEMPLATE = """
             loadTracker();
         }
 
-        /* REQ 4: LOAD SERVICE FEES WITH MONTH FILTER */
         async function loadServiceFees() {
             const monthVal = document.getElementById('fees-month-filter').value;
             const res = await fetch(`/api/service-fees?month=${monthVal}`);
