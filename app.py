@@ -460,10 +460,11 @@ def member_detail_update_delete(member_id):
 
         member_id_actual = m['member_id']
 
+        # FETCH RECENT SAVINGS CONTRIBUTIONS (EXCLUDING SERVICE FEES FOR SAVINGS LOG)
         cursor.execute(f'''
             SELECT id, amount, date, notes, is_service_fee, days_credited 
             FROM savings 
-            WHERE member_id = {p} 
+            WHERE member_id = {p} AND is_service_fee = 0
             ORDER BY id DESC LIMIT 10
         ''', (member_id_actual,))
         savings = [dict(s) for s in cursor.fetchall()]
@@ -552,7 +553,7 @@ def reset_single_member_ledger(member_id):
     return jsonify({'success': True, 'message': f'Financial data for {m["full_name"]} ({actual_id}) reset successfully!'})
 
 # -----------------------------------------------------------------------------
-# BULK SAVINGS & MULTI-MONTH SERVICE FEE SPREADING (ANCHORED TO 1st OF MONTH)
+# BULK SAVINGS & MULTI-MONTH SERVICE FEE SPREADING (REAL PAYMENT DATE + CYCLE 1st RULE)
 # -----------------------------------------------------------------------------
 @app.route('/api/savings', methods=['GET', 'POST'])
 def handle_savings():
@@ -584,9 +585,9 @@ def handle_savings():
         cycle_days = m['cycle_days']
         daily_target = m['daily_target'] if m['daily_target'] > 0 else 500.0
 
-        # Parse payment date and FORCE baseline start to the 1st of that month
+        # Parse payment date and FORCE baseline start to the 1st of that month for month_year cycle tracking
         raw_date = datetime.strptime(savings_date_str, '%Y-%m-%d').date()
-        base_date = raw_date.replace(day=1) # Snapped strictly to 1st of month
+        base_date = raw_date.replace(day=1) # Cycle 1st baseline
         
         start_cycle = current_cycle
 
@@ -596,23 +597,22 @@ def handle_savings():
         total_days_added = 0
         fee_records = []
 
-        # SPREAD SERVICE FEES ACROSS CONSECUTIVE CALENDAR MONTHS (ALWAYS 1st OF MONTH)
+        # SPREAD SERVICE FEES ACROSS CONSECUTIVE CALENDAR MONTHS
         while remaining_cash > 0:
             if cycle_days == 0:
                 fee_deducted = min(daily_target, remaining_cash)
                 remaining_cash -= fee_deducted
                 total_fees_collected += fee_deducted
 
-                # Calculate target fee date (Always 1st of the target month)
+                # Calculate target fee date (Always 1st of the target month for month_year)
                 month_offset = current_cycle - start_cycle
                 target_fee_date = add_months(base_date, month_offset)
-                fee_date_fmt = target_fee_date.strftime('%Y-%m-01')
                 fee_month_fmt = target_fee_date.strftime('%Y-%m')
 
                 fee_records.append({
                     'amount': fee_deducted,
                     'cycle': current_cycle,
-                    'date': fee_date_fmt,
+                    'date': savings_date_str, # ACTUAL PAYMENT DATE FOR DAILY TRACKER INFLOW
                     'month_year': fee_month_fmt,
                     'desc': f'Cycle {current_cycle} Service Fee ({fee_month_fmt})'
                 })
@@ -640,7 +640,7 @@ def handle_savings():
                 current_cycle += 1
                 cycle_days = 0
 
-        # INSERT EXTRACTED SERVICE FEES DATED BY CONSECUTIVE MONTHS (1st OF EACH MONTH)
+        # INSERT EXTRACTED SERVICE FEES (DATED ON ACTUAL PAYMENT DAY)
         for f in fee_records:
             cursor.execute(f'''
                 INSERT INTO savings (member_id, amount, date, month_year, is_service_fee, days_credited, notes)
@@ -853,7 +853,7 @@ def repay_loan():
     return jsonify({'success': True, 'message': 'Loan repayment recorded!'})
 
 # -----------------------------------------------------------------------------
-# DAILY TRACKER
+# DAILY TRACKER (STRICT SINGLE-DAY CASHFLOW FILTER)
 # -----------------------------------------------------------------------------
 @app.route('/api/tracker/daily', methods=['GET'])
 def get_daily_tracker():
@@ -861,16 +861,15 @@ def get_daily_tracker():
     cursor = db.cursor()
     p = query_param()
 
-    selected_date = request.args.get('date', '').strip()
+    # STRICTLY DEFAULT TO TODAY IF NO DATE SELECTED
+    selected_date = request.args.get('date', '').strip() or date.today().isoformat()
 
-    where_savings = f"WHERE s.date = {p}" if selected_date else ""
-    where_repay = f"WHERE lr.date = {p}" if selected_date else ""
-    where_withdraw = f"WHERE w.date = {p}" if selected_date else ""
-    where_loans = f"WHERE l.issue_date = {p}" if selected_date else ""
+    where_savings = f"WHERE s.date = {p}"
+    where_repay = f"WHERE lr.date = {p}"
+    where_withdraw = f"WHERE w.date = {p}"
+    where_loans = f"WHERE l.issue_date = {p}"
 
-    params = []
-    if selected_date:
-        params = [selected_date] * 4
+    params = [selected_date] * 4
 
     query = f'''
         SELECT 'Savings Deposit' as tx_type, s.date, s.member_id, m.full_name, 
@@ -1714,7 +1713,7 @@ INDEX_TEMPLATE = """
                 </button>
             </div>
             <div class="filter-row">
-                <input type="text" id="member-search-dir" placeholder="Search name or ID..." onkeyup="filterDirectoryCards()" autocomplete="off">
+                <input type="text" id="member-search-dir" placeholder="Search name, SVR code, or number..." onkeyup="filterDirectoryCards()" autocomplete="off">
             </div>
             <div id="members-cards-container" class="member-grid-2col"></div>
         </div>
@@ -1831,7 +1830,7 @@ INDEX_TEMPLATE = """
 
     </div>
 
-    <!-- RICH MEMBER DETAIL MODAL (RESTORED MULTI-TAB INTERFACE) -->
+    <!-- RICH MEMBER DETAIL MODAL (RESTORED MULTI-TAB INTERFACE & RECENT CONTRIBUTIONS) -->
     <div class="modal-overlay" id="member-detail-modal" onclick="if(event.target===this) closeModal('member-detail-modal')">
         <div class="modal-card">
             <div class="modal-header">
@@ -1863,9 +1862,27 @@ INDEX_TEMPLATE = """
                     <div class="modal-detail-item"><span>Service Fees Paid:</span><span style="color:var(--amber-fee); font-weight:800;" id="md-service-fees">₦0.00</span></div>
                     <div class="modal-detail-item"><span>Daily Target Amount:</span><span style="font-weight:700;" id="md-daily-target">₦0.00</span></div>
                 </div>
+
+                <!-- RECENT CONTRIBUTIONS HISTORY IN MODAL OVERVIEW -->
+                <div style="font-size: 0.9rem; font-weight: 800; margin: 12px 0 6px 0; color: var(--text-dark);">
+                    Recent Contributions History
+                </div>
+                <div class="table-responsive">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>DATE</th>
+                                <th>AMOUNT</th>
+                                <th>DAYS</th>
+                                <th>NOTES</th>
+                            </tr>
+                        </thead>
+                        <tbody id="md-recent-contributions-body"></tbody>
+                    </table>
+                </div>
             </div>
 
-            <!-- PANEL 2: SAVINGS HISTORY -->
+            <!-- PANEL 2: SAVINGS HISTORY TAB -->
             <div class="modal-tab-panel" id="md-tab-savings">
                 <div class="table-responsive">
                     <table>
@@ -2123,23 +2140,38 @@ INDEX_TEMPLATE = """
             }
         }
 
+        // ULTRA-SMART MULTI-FORMAT SEARCH MATCHING (1-Digit, 2-Digit, Name, or SVR ID)
+        function filterMembersListByQuery(query) {
+            if (!query) return membersList;
+            const cleanQ = query.toLowerCase().trim();
+            const numVal = parseInt(cleanQ, 10);
+
+            return membersList.filter(m => {
+                const name = (m.full_name || '').toLowerCase();
+                const id = (m.member_id || '').toLowerCase();
+                const digitsOnly = id.replace(/\D/g, ''); // Extract numeric digits e.g. "0001"
+                const parsedNum = parseInt(digitsOnly, 10); // Number integer e.g. 1
+
+                return name.includes(cleanQ) || 
+                       id.includes(cleanQ) || 
+                       digitsOnly.includes(cleanQ) || 
+                       (!isNaN(numVal) && parsedNum === numVal);
+            });
+        }
+
         function filterDirectoryCards() {
-            const query = document.getElementById('member-search-dir').value.toLowerCase().trim();
-            const filtered = membersList.filter(m => 
-                m.full_name.toLowerCase().includes(query) || m.member_id.toLowerCase().includes(query)
-            );
+            const query = (document.getElementById('member-search-dir') || document.getElementById('dir-filter-input')).value;
+            const filtered = filterMembersListByQuery(query);
             renderMembersDirectory(filtered);
         }
 
-        // FAST SEARCH DROPDOWN
+        // FAST SEARCH DROPDOWN FOR HEADER
         function handleGlobalSearchInput(e) {
-            const query = e.target.value.toLowerCase().trim();
+            const query = e.target.value;
             const dropdown = document.getElementById('search-results-dropdown');
-            if (!query) { dropdown.style.display = 'none'; return; }
+            if (!query.trim()) { dropdown.style.display = 'none'; return; }
             
-            const filtered = membersList.filter(m => 
-                m.full_name.toLowerCase().includes(query) || m.member_id.toLowerCase().includes(query)
-            );
+            const filtered = filterMembersListByQuery(query);
 
             if (filtered.length > 0) {
                 dropdown.innerHTML = filtered.map(m => `
@@ -2296,15 +2328,19 @@ INDEX_TEMPLATE = """
             document.getElementById('tracker-net-cashflow').innerText = `₦${d.net_cashflow.toLocaleString()}`;
 
             const tbody = document.getElementById('tracker-table-body');
-            tbody.innerHTML = d.logs.map(l => `
-                <tr>
-                    <td><span class="badge ${l.tx_type.includes('Deposit') ? 'badge-savings' : 'badge-payout'}">${l.tx_type}</span></td>
-                    <td>${l.full_name}</td>
-                    <td style="color:var(--primary-green-dark); font-weight:800;">₦${l.gross_inflow.toLocaleString()}</td>
-                    <td style="color:var(--amber-fee);">₦${l.service_fee.toLocaleString()}</td>
-                    <td style="color:var(--primary-red);">₦${l.outflow.toLocaleString()}</td>
-                </tr>
-            `).join('');
+            if (d.logs.length === 0) {
+                tbody.innerHTML = `<tr><td colspan="5" style="text-align:center; color:var(--text-muted); padding:16px;">No transactions recorded for ${d.selected_date}</td></tr>`;
+            } else {
+                tbody.innerHTML = d.logs.map(l => `
+                    <tr>
+                        <td><span class="badge ${l.tx_type.includes('Deposit') ? 'badge-savings' : 'badge-payout'}">${l.tx_type}</span></td>
+                        <td>${l.full_name}</td>
+                        <td style="color:var(--primary-green-dark); font-weight:800;">₦${l.gross_inflow.toLocaleString()}</td>
+                        <td style="color:var(--amber-fee);">₦${l.service_fee.toLocaleString()}</td>
+                        <td style="color:var(--primary-red);">₦${l.outflow.toLocaleString()}</td>
+                    </tr>
+                `).join('');
+            }
         }
 
         async function loadMonthlyFees() {
@@ -2357,7 +2393,7 @@ INDEX_TEMPLATE = """
             }
         }
 
-        // OPEN RICH MULTI-TAB MEMBER MODAL
+        // OPEN RICH MULTI-TAB MEMBER MODAL WITH RECENT CONTRIBUTIONS
         async function openMemberEditModal(memberId) {
             const res = await fetch(`/api/member/${memberId}`);
             const d = await res.json();
@@ -2376,25 +2412,34 @@ INDEX_TEMPLATE = """
                 document.getElementById('md-service-fees').innerText = `₦${m.total_service_fees.toLocaleString()}`;
                 document.getElementById('md-daily-target').innerText = `₦${m.daily_target.toLocaleString()}`;
 
-                // Recent Savings History Tab
-                const savingsTbody = document.getElementById('md-savings-table-body');
-                savingsTbody.innerHTML = d.recent_savings.map(s => `
-                    <tr>
-                        <td>${s.date}</td>
-                        <td style="color:var(--primary-green-dark); font-weight:800;">₦${s.amount.toLocaleString()}</td>
-                        <td>${s.days_credited} days</td>
-                        <td>${s.notes || '-'}</td>
-                    </tr>
-                `).join('');
+                // RENDER RECENT CONTRIBUTIONS HISTORY IN MODAL OVERVIEW & SAVINGS TAB
+                const renderRecentSavings = (tbodyId) => {
+                    const tbody = document.getElementById(tbodyId);
+                    if (d.recent_savings.length === 0) {
+                        tbody.innerHTML = `<tr><td colspan="4" style="text-align:center; color:var(--text-muted);">No contribution history found</td></tr>`;
+                    } else {
+                        tbody.innerHTML = d.recent_savings.slice(0, 5).map(s => `
+                            <tr>
+                                <td>${s.date}</td>
+                                <td style="color:var(--primary-green-dark); font-weight:800;">₦${s.amount.toLocaleString()}</td>
+                                <td>${s.days_credited} days</td>
+                                <td>${s.notes || '-'}</td>
+                            </tr>
+                        `).join('');
+                    }
+                };
 
-                // Edit Profile Tab
+                renderRecentSavings('md-recent-contributions-body');
+                renderRecentSavings('md-savings-table-body');
+
+                // Edit Profile Tab Form Fields
                 document.getElementById('edit-member-id').value = m.member_id;
                 document.getElementById('edit-fullname').value = m.full_name;
                 document.getElementById('edit-username').value = m.username;
                 document.getElementById('edit-target').value = m.daily_target;
                 document.getElementById('edit-password').value = '';
 
-                // Reset Tab Focus to "Overview"
+                // Reset Modal View to First Tab ("Overview")
                 document.querySelectorAll('.modal-tab-panel').forEach(p => p.classList.remove('active'));
                 document.querySelectorAll('.modal-tab').forEach(b => b.classList.remove('active'));
                 document.getElementById('md-tab-overview').classList.add('active');
