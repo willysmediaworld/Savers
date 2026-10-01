@@ -25,7 +25,7 @@ def add_months(sourcedate, months):
     return date(year, month, 1)
 
 # -----------------------------------------------------------------------------
-# DATABASE SETUP & SPEED INDEXING
+# DATABASE SETUP & SPEED OPTIMIZATIONS (WAL MODE + INDEXES)
 # -----------------------------------------------------------------------------
 def get_db():
     if 'db' not in g:
@@ -36,8 +36,12 @@ def get_db():
             g.db = psycopg2.connect(url, cursor_factory=psycopg2.extras.DictCursor)
         else:
             db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'savers_growth.db')
-            g.db = sqlite3.connect(db_path)
+            g.db = sqlite3.connect(db_path, timeout=15)
             g.db.row_factory = sqlite3.Row
+            # SPEED BOOST: SQLite WAL Mode & Fast Synchronous Write
+            g.db.execute("PRAGMA journal_mode=WAL;")
+            g.db.execute("PRAGMA synchronous=NORMAL;")
+            g.db.execute("PRAGMA temp_store=MEMORY;")
     return g.db
 
 @app.teardown_appcontext
@@ -162,11 +166,13 @@ def init_db():
             )
         ''')
 
-        # SPEED OPTIMIZATION: Database Indexes
+        # SPEED INDEXES
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_members_mid ON members(member_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_members_uname ON members(username)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_savings_mid ON savings(member_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_loans_mid ON loans(member_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_savings_fee ON savings(member_id, is_service_fee)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_withdrawals_mid ON withdrawals(member_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_loans_mid ON loans(member_id, status)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_archives_mid ON transaction_archives(member_id)")
 
         db.commit()
@@ -339,14 +345,28 @@ def manage_members():
             return jsonify({'success': False, 'message': str(e)}), 500
 
     else:
+        # HIGH-SPEED OPTIMIZED QUERY (Eliminates N+1 subqueries)
         cursor.execute('''
-            SELECT m.id, m.member_id, m.full_name, m.phone, m.email, m.username, m.daily_target,
-                   m.current_cycle, m.cycle_days, m.status, m.created_at,
-                   COALESCE((SELECT SUM(amount) FROM savings WHERE member_id = m.member_id AND is_service_fee = 0), 0) as total_saved,
-                   COALESCE((SELECT SUM(amount) FROM withdrawals WHERE member_id = m.member_id), 0) as total_withdrawn,
-                   COALESCE((SELECT SUM(repayment_amount - amount_paid) FROM loans WHERE member_id = m.member_id AND status = 'active'), 0) as active_loan,
-                   COALESCE((SELECT SUM(amount) FROM service_fees WHERE member_id = m.member_id), 0) as total_service_fees
+            SELECT 
+                m.id, m.member_id, m.full_name, m.phone, m.email, m.username, m.daily_target,
+                m.current_cycle, m.cycle_days, m.status, m.created_at,
+                COALESCE(s.total_saved, 0) as total_saved,
+                COALESCE(w.total_withdrawn, 0) as total_withdrawn,
+                COALESCE(l.active_loan, 0) as active_loan,
+                COALESCE(f.total_service_fees, 0) as total_service_fees
             FROM members m
+            LEFT JOIN (
+                SELECT member_id, SUM(amount) as total_saved FROM savings WHERE is_service_fee = 0 GROUP BY member_id
+            ) s ON m.member_id = s.member_id
+            LEFT JOIN (
+                SELECT member_id, SUM(amount) as total_withdrawn FROM withdrawals GROUP BY member_id
+            ) w ON m.member_id = w.member_id
+            LEFT JOIN (
+                SELECT member_id, SUM(repayment_amount - amount_paid) as active_loan FROM loans WHERE status = 'active' GROUP BY member_id
+            ) l ON m.member_id = l.member_id
+            LEFT JOIN (
+                SELECT member_id, SUM(amount) as total_service_fees FROM service_fees GROUP BY member_id
+            ) f ON m.member_id = f.member_id
             ORDER BY m.id ASC
         ''')
         rows = cursor.fetchall()
@@ -422,7 +442,7 @@ def member_detail_update_delete(member_id):
             ''', (full_name, username, daily_target, member_id))
 
         db.commit()
-        return jsonify({'success': True, 'message': 'Member profile & credentials updated!'})
+        return jsonify({'success': True, 'message': 'Member profile updated successfully!'})
 
     else:
         cursor.execute(f'''
@@ -531,7 +551,7 @@ def reset_single_member_ledger(member_id):
     return jsonify({'success': True, 'message': f'Financial data for {m["full_name"]} ({actual_id}) reset successfully!'})
 
 # -----------------------------------------------------------------------------
-# BULK SAVINGS & MULTI-MONTH SERVICE FEE SPREADING (UPDATED 1st OF MONTH RULE)
+# BULK SAVINGS & MULTI-MONTH SERVICE FEE SPREADING (ANCHORED TO 1st OF MONTH)
 # -----------------------------------------------------------------------------
 @app.route('/api/savings', methods=['GET', 'POST'])
 def handle_savings():
@@ -565,7 +585,7 @@ def handle_savings():
 
         # Parse payment date and FORCE baseline start to the 1st of that month
         raw_date = datetime.strptime(savings_date_str, '%Y-%m-%d').date()
-        base_date = raw_date.replace(day=1) # Snapped strictly to 1st of month
+        base_date = raw_date.replace(day=1) # Strictly anchored to 1st of month
         
         start_cycle = current_cycle
 
@@ -664,36 +684,6 @@ def handle_savings():
         ''')
         rows = cursor.fetchall()
         return jsonify([dict(r) for r in rows])
-
-@app.route('/api/savings/<int:savings_id>', methods=['DELETE'])
-def delete_savings(savings_id):
-    db = get_db()
-    cursor = db.cursor()
-    p = query_param()
-
-    cursor.execute(f'SELECT member_id, amount, is_service_fee, days_credited FROM savings WHERE id = {p}', (savings_id,))
-    row = cursor.fetchone()
-    if not row:
-        return jsonify({'success': False, 'message': 'Entry not found.'}), 404
-
-    member_id = row['member_id']
-    is_fee = row['is_service_fee']
-    days_credited = row['days_credited']
-
-    cursor.execute(f'DELETE FROM savings WHERE id = {p}', (savings_id,))
-
-    if is_fee:
-        cursor.execute(f'DELETE FROM service_fees WHERE member_id = {p} AND amount = {p}', (member_id, row['amount']))
-        cursor.execute(f'UPDATE members SET cycle_days = 0 WHERE member_id = {p}', (member_id,))
-    else:
-        cursor.execute(f'SELECT cycle_days FROM members WHERE member_id = {p}', (member_id,))
-        m = cursor.fetchone()
-        if m:
-            new_days = max(0, m['cycle_days'] - days_credited)
-            cursor.execute(f'UPDATE members SET cycle_days = {p} WHERE member_id = {p}', (new_days, member_id))
-
-    db.commit()
-    return jsonify({'success': True, 'message': 'Contribution deleted!'})
 
 # -----------------------------------------------------------------------------
 # WITHDRAWAL
@@ -1037,14 +1027,14 @@ def index():
     return render_template_string(INDEX_TEMPLATE)
 
 # -----------------------------------------------------------------------------
-# FRONTEND TEMPLATE (COMPLETE & UN-CONDENSED)
+# HTML/CSS/JS FRONTEND (100% MOBILE RESPONSIVE & HIGH SPEED ENGINE)
 # -----------------------------------------------------------------------------
 INDEX_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <title>Savers Growth System</title>
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
@@ -1072,7 +1062,7 @@ INDEX_TEMPLATE = """
             background-color: var(--bg-body);
             color: var(--text-dark);
             display: flex; flex-direction: column; min-height: 100vh;
-            padding-top: 112px;
+            padding-top: calc(112px + env(safe-area-inset-top));
         }
 
         /* Toast Notifications */
@@ -1080,7 +1070,7 @@ INDEX_TEMPLATE = """
         .toast {
             background: #1e293b; color: #fff; padding: 12px 18px; border-radius: 12px;
             margin-bottom: 8px; box-shadow: 0 8px 20px rgba(0,0,0,0.15);
-            display: flex; align-items: center; gap: 8px; animation: slideIn 0.25s forwards;
+            display: flex; align-items: center; gap: 8px; animation: slideIn 0.2s ease-out forwards;
             font-size: 0.88rem; font-weight: 600;
         }
         .toast.success { background: var(--primary-green-dark); }
@@ -1092,6 +1082,7 @@ INDEX_TEMPLATE = """
             position: fixed; top: 0; left: 0; right: 0; z-index: 1000;
             background: #ffffff; border-bottom: 1.5px solid var(--border-light);
             box-shadow: 0 2px 10px rgba(0,0,0,0.04);
+            padding-top: env(safe-area-inset-top);
         }
 
         header { padding: 0.75rem 1rem 0.25rem 1rem; display: flex; justify-content: space-between; align-items: center; }
@@ -1113,7 +1104,7 @@ INDEX_TEMPLATE = """
         header .btn-logout {
             background: #ffffff; color: var(--text-dark); border: 1.5px solid var(--text-dark);
             padding: 6px 14px; border-radius: 20px; font-weight: 700; font-size: 0.82rem;
-            cursor: pointer; min-height: 36px;
+            cursor: pointer; min-height: 38px; touch-action: manipulation;
         }
 
         /* SEARCH BAR & FIXED STICKY BACK BUTTON ROW */
@@ -1126,40 +1117,41 @@ INDEX_TEMPLATE = """
             background: #0f172a; color: #ffffff; border: none; padding: 9px 14px;
             border-radius: 20px; font-weight: 800; font-size: 0.82rem; cursor: pointer;
             display: none; align-items: center; gap: 6px; white-space: nowrap; flex-shrink: 0;
-            box-shadow: 0 2px 6px rgba(0,0,0,0.12);
+            box-shadow: 0 2px 6px rgba(0,0,0,0.12); touch-action: manipulation;
         }
         .btn-back-sticky:active { transform: scale(0.96); }
 
         .search-wrapper { position: relative; width: 100%; flex: 1; }
         .search-wrapper i { position: absolute; left: 16px; top: 50%; transform: translateY(-50%); color: #94a3b8; font-size: 0.95rem; }
+        
+        /* 16px Font Size strictly prevents iOS from auto-zooming on focus */
         .search-input {
-            width: 100%; padding: 9px 16px 9px 42px; border-radius: 30px;
-            border: 1.5px solid var(--border-light); font-size: 0.88rem; outline: none; background: #ffffff;
+            width: 100%; padding: 10px 16px 10px 42px; border-radius: 30px;
+            border: 1.5px solid var(--border-light); font-size: 16px !important; outline: none; background: #ffffff;
+            appearance: none; -webkit-appearance: none;
         }
+        
         .search-results-dropdown {
             position: absolute; top: 100%; left: 0; right: 0; background: #ffffff;
-            border: 1.5px solid var(--border-light); border-radius: 16px; box-shadow: 0 10px 25px rgba(0,0,0,0.1);
-            z-index: 600; max-height: 240px; overflow-y: auto; display: none; margin-top: 4px;
+            border: 1.5px solid var(--border-light); border-radius: 16px; box-shadow: 0 12px 25px rgba(0,0,0,0.15);
+            z-index: 2000; max-height: 260px; overflow-y: auto; display: none; margin-top: 6px;
+            -webkit-overflow-scrolling: touch;
         }
         .search-result-item {
             padding: 12px 16px; border-bottom: 1px solid var(--border-light); cursor: pointer;
             display: flex; justify-content: space-between; align-items: center; font-size: 0.88rem; font-weight: 600;
         }
-        .search-result-item:hover { background: #f8fafc; }
+        .search-result-item:last-child { border-bottom: none; }
+        .search-result-item:hover, .search-result-item:active { background: #f1f5f9; }
 
         .app-container { max-width: 600px; margin: 0 auto; width: 100%; padding: 1rem 1rem 2rem 1rem; flex: 1; }
 
         .view-section { display: none; }
-        .view-section.active { display: block; animation: fadeIn 0.2s forwards; }
-        @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+        .view-section.active { display: block; animation: fadeIn 0.15s ease-in forwards; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: translateY(0); } }
 
         .view-header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.1rem; }
         .view-title-group { display: flex; align-items: center; gap: 8px; font-size: 1.15rem; font-weight: 800; }
-        .btn-add-header {
-            background: var(--primary-green); color: #ffffff; border: none;
-            padding: 8px 14px; border-radius: 10px; font-weight: 700; font-size: 0.82rem; cursor: pointer;
-            display: flex; align-items: center; gap: 6px;
-        }
 
         .login-card {
             background: #ffffff; border: 1.5px solid var(--border-light);
@@ -1179,11 +1171,12 @@ INDEX_TEMPLATE = """
             background: var(--card-bg); border: 1.5px solid var(--border-light);
             border-radius: var(--radius-card); padding: 0.85rem 0.3rem; display: flex;
             flex-direction: column; align-items: center; justify-content: center; text-align: center;
-            cursor: pointer; box-shadow: 0 2px 4px rgba(0,0,0,0.02); transition: all 0.15s; min-height: 92px;
+            cursor: pointer; box-shadow: 0 2px 4px rgba(0,0,0,0.02); transition: transform 0.1s; min-height: 92px;
+            touch-action: manipulation;
         }
-        .menu-card:active { transform: scale(0.97); }
+        .menu-card:active { transform: scale(0.96); }
         .menu-card .icon-badge {
-            width: 36px; height: 36px; border-radius: 10px; display: flex; align-items: center; justify-content: center;
+            width: 38px; height: 38px; border-radius: 12px; display: flex; align-items: center; justify-content: center;
             font-size: 1.1rem; margin-bottom: 4px;
         }
         .icon-badge.pink { background: #ffe4e6; }
@@ -1193,7 +1186,7 @@ INDEX_TEMPLATE = """
         .icon-badge.purple { background: #f3e8ff; }
         .icon-badge.teal { background: #ccfbf1; }
 
-        .menu-card .card-heading { font-size: 0.8rem; font-weight: 800; color: var(--text-dark); line-height: 1.15; }
+        .menu-card .card-heading { font-size: 0.78rem; font-weight: 800; color: var(--text-dark); line-height: 1.15; }
 
         .grid-row-4-center { display: flex; justify-content: center; gap: 10px; margin-top: 10px; flex-wrap: wrap; }
         .grid-row-4-center .menu-card { width: calc(33.333% - 7px); }
@@ -1212,23 +1205,28 @@ INDEX_TEMPLATE = """
         .btn-action-primary {
             background: var(--primary-red); color: white; border: none; padding: 14px;
             border-radius: 12px; font-weight: 800; font-size: 0.95rem; cursor: pointer;
-            display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 48px;
+            display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 48px; touch-action: manipulation;
         }
         .btn-action-secondary {
             background: #e2e8f0; color: var(--text-dark); border: none; padding: 14px;
             border-radius: 12px; font-weight: 800; font-size: 0.95rem; cursor: pointer;
-            display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 48px;
+            display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 48px; touch-action: manipulation;
         }
 
         .filter-row { display: flex; gap: 8px; margin-bottom: 1rem; }
-        .filter-row input, .filter-row select { flex: 1; padding: 10px 14px; border-radius: 12px; border: 1.5px solid var(--border-light); font-size: 0.88rem; background: #fff; }
+        .filter-row input, .filter-row select {
+            flex: 1; padding: 11px 14px; border-radius: 12px; border: 1.5px solid var(--border-light);
+            font-size: 16px !important; background: #fff; outline: none;
+        }
 
         .member-grid-2col { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
         .member-card-item {
             background: #ffffff; border: 1.5px solid var(--border-light);
             border-radius: 14px; padding: 0.75rem; cursor: pointer;
             box-shadow: 0 2px 4px rgba(0,0,0,0.01); display: flex; flex-direction: column; justify-content: space-between;
+            touch-action: manipulation;
         }
+        .member-card-item:active { background: #f8fafc; transform: scale(0.98); }
         .member-card-header { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
         .member-avatar {
             width: 32px; height: 32px; border-radius: 50%; background: #d1fae5; color: #059669;
@@ -1243,7 +1241,6 @@ INDEX_TEMPLATE = """
         }
         .stat-line { font-weight: 600; color: var(--text-dark); display: flex; justify-content: space-between; }
         .stat-line .val-green { color: var(--primary-green-dark); font-weight: 800; }
-        .stat-line .val-red { color: var(--primary-red); font-weight: 800; }
 
         .cycle-status-btn {
             background: var(--purple-bg); border: 1px solid var(--purple-border); color: var(--purple-cycle);
@@ -1251,57 +1248,46 @@ INDEX_TEMPLATE = """
             display: flex; align-items: center; justify-content: center; gap: 4px;
         }
 
+        /* NATIVE MOBILE SLIDE-UP MODAL */
         .modal-overlay {
             position: fixed; top: 0; left: 0; right: 0; bottom: 0;
             background: rgba(15, 23, 42, 0.6); backdrop-filter: blur(3px);
-            z-index: 2000; display: none; align-items: center; justify-content: center; padding: 0.85rem;
+            z-index: 3000; display: none; align-items: flex-end; justify-content: center;
+        }
+        @media (min-width: 600px) {
+            .modal-overlay { align-items: center; padding: 1rem; }
         }
         .modal-overlay.active { display: flex; }
         .modal-card {
-            background: #ffffff; border-radius: 20px; width: 100%; max-width: 480px;
-            max-height: 90vh; overflow-y: auto; padding: 1.25rem; box-shadow: 0 20px 25px -5px rgba(0,0,0,0.1);
-            animation: modalUp 0.2s forwards;
+            background: #ffffff; border-radius: 24px 24px 0 0; width: 100%; max-width: 500px;
+            max-height: 85vh; overflow-y: auto; padding: 1.25rem; box-shadow: 0 -10px 25px rgba(0,0,0,0.15);
+            animation: slideModal 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+            -webkit-overflow-scrolling: touch;
         }
-        @keyframes modalUp { from { transform: translateY(15px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+        @media (min-width: 600px) {
+            .modal-card { border-radius: 20px; animation: modalFade 0.2s forwards; }
+        }
+        @keyframes slideModal { from { transform: translateY(100%); } to { transform: translateY(0); } }
+        @keyframes modalFade { from { transform: scale(0.95); opacity: 0; } to { transform: scale(1); opacity: 1; } }
 
-        .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.85rem; }
+        .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }
         .modal-title { font-size: 1.1rem; font-weight: 800; color: var(--text-dark); }
-        .modal-close { background: none; border: none; font-size: 1.5rem; color: var(--text-muted); cursor: pointer; }
-
-        .modal-nav-tabs {
-            display: flex; gap: 6px; overflow-x: auto; padding-bottom: 6px; margin-bottom: 1rem;
-            border-bottom: 1px solid var(--border-light);
-        }
-        .modal-tab {
-            padding: 6px 12px; border-radius: 16px; font-size: 0.8rem; font-weight: 700;
-            border: 1px solid var(--border-light); cursor: pointer; white-space: nowrap; color: var(--text-muted);
-            background: #ffffff;
-        }
-        .modal-tab.active { background: #f0fdf4; border-color: #bbf7d0; color: var(--primary-green-dark); }
-
-        .modal-tab-panel { display: none; }
-        .modal-tab-panel.active { display: block; }
-
-        .modal-details-list { display: flex; flex-direction: column; gap: 8px; font-size: 0.9rem; margin-bottom: 1rem; }
-        .modal-detail-item { display: flex; justify-content: space-between; font-weight: 600; }
-
-        .modal-cycle-box {
-            background: var(--purple-bg); border: 1.5px solid var(--purple-border); border-radius: 12px;
-            padding: 10px 14px; margin-bottom: 1rem;
-        }
-        .modal-cycle-box .lbl { font-size: 0.72rem; font-weight: 800; color: var(--purple-cycle); text-transform: uppercase; margin-bottom: 2px; }
-        .modal-cycle-box .val { font-weight: 800; color: var(--purple-cycle); font-size: 0.95rem; }
+        .modal-close { background: #f1f5f9; border: none; font-size: 1.2rem; width: 32px; height: 32px; border-radius: 50%; color: var(--text-muted); cursor: pointer; display: flex; align-items: center; justify-content: center; }
 
         .card-form { background: #fff; border: 1.5px solid var(--border-light); border-radius: 16px; padding: 1.1rem; }
         .form-group { display: flex; flex-direction: column; gap: 5px; margin-bottom: 0.85rem; }
         .form-group label { font-size: 0.82rem; font-weight: 700; color: var(--text-dark); }
+        
+        /* 16px Font Size prevents zoom */
         .form-control {
             padding: 11px 12px; border-radius: 10px; border: 1.5px solid var(--border-light);
-            font-size: 0.9rem; outline: none; background: #fff; width: 100%; min-height: 44px;
+            font-size: 16px !important; outline: none; background: #fff; width: 100%; min-height: 46px;
+            appearance: none; -webkit-appearance: none;
         }
         .btn-submit {
             background: var(--primary-green); color: white; border: none; padding: 12px;
-            border-radius: 10px; font-weight: 700; font-size: 0.9rem; cursor: pointer; width: 100%; min-height: 46px;
+            border-radius: 10px; font-weight: 700; font-size: 0.95rem; cursor: pointer; width: 100%; min-height: 48px;
+            touch-action: manipulation;
         }
 
         .manage-subcard {
@@ -1310,9 +1296,9 @@ INDEX_TEMPLATE = """
         }
         .manage-subcard-title { font-size: 0.88rem; font-weight: 800; margin-bottom: 0.6rem; display: flex; align-items: center; gap: 6px; }
 
-        .table-responsive { overflow-x: auto; border-radius: 12px; border: 1.5px solid var(--border-light); }
-        table { width: 100%; border-collapse: collapse; text-align: left; font-size: 0.82rem; }
-        th, td { padding: 9px 10px; border-bottom: 1px solid var(--border-light); }
+        .table-responsive { overflow-x: auto; border-radius: 12px; border: 1.5px solid var(--border-light); -webkit-overflow-scrolling: touch; }
+        table { width: 100%; border-collapse: collapse; text-align: left; font-size: 0.82rem; white-space: nowrap; }
+        th, td { padding: 10px 12px; border-bottom: 1px solid var(--border-light); }
         th { background: #f8fafc; font-weight: 700; color: var(--text-muted); text-transform: uppercase; font-size: 0.68rem; }
         
         .badge { padding: 3px 6px; border-radius: 6px; font-size: 0.7rem; font-weight: 800; display: inline-block; }
@@ -1321,9 +1307,8 @@ INDEX_TEMPLATE = """
         .badge-payout { background: #fee2e2; color: #991b1b; }
         .badge-success { background: #d1fae5; color: #065f46; }
 
-        .btn-delete-sm { background: var(--primary-red); color: white; border: none; padding: 5px 10px; border-radius: 6px; font-size: 0.72rem; font-weight: 700; cursor: pointer; }
-        .btn-edit-sm { background: #2563eb; color: white; border: none; padding: 5px 10px; border-radius: 6px; font-size: 0.72rem; font-weight: 700; cursor: pointer; margin-right: 2px; }
-        .btn-repay-sm { background: var(--primary-green-dark); color: white; border: none; padding: 5px 10px; border-radius: 6px; font-size: 0.72rem; font-weight: 700; cursor: pointer; }
+        .btn-edit-sm { background: #2563eb; color: white; border: none; padding: 6px 12px; border-radius: 6px; font-size: 0.75rem; font-weight: 700; cursor: pointer; touch-action: manipulation; }
+        .btn-repay-sm { background: var(--primary-green-dark); color: white; border: none; padding: 6px 12px; border-radius: 6px; font-size: 0.75rem; font-weight: 700; cursor: pointer; touch-action: manipulation; }
 
         footer {
             background: #ffffff; color: var(--text-dark); text-align: center;
@@ -1351,6 +1336,7 @@ INDEX_TEMPLATE = """
             </div>
         </header>
 
+        <!-- GLOBAL SEARCH BAR & BACK BUTTON -->
         <div class="sticky-nav-bar" id="admin-search-container">
             <button class="btn-back-sticky" id="global-back-btn" onclick="goBackHome()">
                 <i class="fa-solid fa-arrow-left"></i> Back
@@ -1359,7 +1345,8 @@ INDEX_TEMPLATE = """
             <div class="search-wrapper">
                 <i class="fa-solid fa-magnifying-glass"></i>
                 <input type="text" class="search-input" id="global-search-input" 
-                       placeholder="Type member ID or name..." 
+                       placeholder="Search member name or ID..." 
+                       autocomplete="off"
                        oninput="handleGlobalSearchInput(event)">
             </div>
             <div class="search-results-dropdown" id="search-results-dropdown"></div>
@@ -1379,11 +1366,11 @@ INDEX_TEMPLATE = """
                 <form onsubmit="handleLoginSubmit(event)">
                     <div class="form-group">
                         <label>Username / Member ID</label>
-                        <input type="text" class="form-control" id="login-username" placeholder="Enter username or Member ID" required>
+                        <input type="text" class="form-control" id="login-username" placeholder="Enter username or Member ID" required autocomplete="username">
                     </div>
                     <div class="form-group">
                         <label>Password</label>
-                        <input type="password" class="form-control" id="login-password" placeholder="Enter password" required>
+                        <input type="password" class="form-control" id="login-password" placeholder="Enter password" required autocomplete="current-password">
                     </div>
                     <button type="submit" class="btn-submit" style="margin-top: 8px;">Login to System</button>
                 </form>
@@ -1662,6 +1649,9 @@ INDEX_TEMPLATE = """
         <!-- VIEW 8: MEMBERS DIRECTORY -->
         <div id="view-members" class="view-section">
             <div class="view-header-row"><div class="view-title-group">👥 Members Directory</div></div>
+            <div class="filter-row">
+                <input type="text" id="dir-filter-input" placeholder="Type name or SVR code..." onkeyup="filterDirectoryCards()" autocomplete="off">
+            </div>
             <div id="members-cards-container" class="member-grid-2col"></div>
         </div>
 
@@ -1672,7 +1662,7 @@ INDEX_TEMPLATE = """
                 <form onsubmit="handleRegisterSubmit(event)">
                     <div class="form-group">
                         <label>Full Name</label>
-                        <input type="text" class="form-control" id="reg-fullname" placeholder="John Doe" required>
+                        <input type="text" class="form-control" id="reg-fullname" placeholder="John Doe" required autocomplete="name">
                     </div>
                     <div class="form-group">
                         <label>Daily Target Amount (₦)</label>
@@ -1778,10 +1768,10 @@ INDEX_TEMPLATE = """
     </div>
 
     <!-- MODAL: MEMBER DETAILS & EDIT -->
-    <div class="modal-overlay" id="member-detail-modal">
+    <div class="modal-overlay" id="member-detail-modal" onclick="if(event.target===this) closeModal('member-detail-modal')">
         <div class="modal-card">
             <div class="modal-header">
-                <div class="modal-title" id="md-title">Member Details</div>
+                <div class="modal-title" id="md-title">Edit Member Profile</div>
                 <button class="modal-close" onclick="closeModal('member-detail-modal')">&times;</button>
             </div>
             <div class="card-form">
@@ -1800,21 +1790,21 @@ INDEX_TEMPLATE = """
                         <input type="number" class="form-control" id="edit-target" required>
                     </div>
                     <div class="form-group">
-                        <label>New Password (Leave blank to keep unchanged)</label>
-                        <input type="password" class="form-control" id="edit-password" placeholder="••••••••">
+                        <label>New Password (Optional)</label>
+                        <input type="password" class="form-control" id="edit-password" placeholder="Leave blank to keep current">
                     </div>
                     <button type="submit" class="btn-submit">Save Member Changes</button>
                 </form>
-                <div style="margin-top:10px; display:flex; gap:8px;">
-                    <button class="btn-submit" style="background:#0f172a;" onclick="resetMemberLedgerFromModal()">Reset Financial Balance</button>
-                    <button class="btn-submit" style="background:var(--primary-red);" onclick="deleteMemberFromModal()">Delete Member</button>
+                <div style="margin-top:12px; display:flex; gap:8px;">
+                    <button class="btn-submit" style="background:#0f172a;" onclick="resetMemberLedgerFromModal()">Reset Balance</button>
+                    <button class="btn-submit" style="background:var(--primary-red);" onclick="deleteMemberFromModal()">Delete Profile</button>
                 </div>
             </div>
         </div>
     </div>
 
     <!-- MODAL: LOAN REPAYMENT -->
-    <div class="modal-overlay" id="loan-repay-modal">
+    <div class="modal-overlay" id="loan-repay-modal" onclick="if(event.target===this) closeModal('loan-repay-modal')">
         <div class="modal-card">
             <div class="modal-header">
                 <div class="modal-title">Record Loan Repayment</div>
@@ -1859,6 +1849,15 @@ INDEX_TEMPLATE = """
             document.getElementById(id).classList.remove('active');
         }
 
+        // Close search dropdown on click outside
+        document.addEventListener('click', function(e) {
+            const dropdown = document.getElementById('search-results-dropdown');
+            const searchInput = document.getElementById('global-search-input');
+            if (dropdown && !dropdown.contains(e.target) && e.target !== searchInput) {
+                dropdown.style.display = 'none';
+            }
+        });
+
         async function initApp() {
             const today = new Date().toISOString().split('T')[0];
             const currentMonth = new Date().toISOString().slice(0, 7);
@@ -1876,6 +1875,10 @@ INDEX_TEMPLATE = """
                 if (data.logged_in) {
                     currentUser = data;
                     document.getElementById('header-member-count').innerText = data.total_members || 0;
+                    
+                    // PRE-LOAD MEMBERS LIST IN BACKGROUND FOR IMMEDIATE SEARCH
+                    loadMembers();
+
                     if (data.role === 'admin') {
                         showSection('home');
                     } else {
@@ -1955,14 +1958,34 @@ INDEX_TEMPLATE = """
             selects.forEach(id => {
                 const el = document.getElementById(id);
                 if (el) {
+                    const currentVal = el.value;
                     el.innerHTML = '<option value="">-- Select Member --</option>' +
                         membersList.map(m => `<option value="${m.member_id}">${m.full_name} (${m.member_id})</option>`).join('');
+                    if (currentVal) el.value = currentVal;
                 }
             });
 
+            renderMembersDirectory(membersList);
+
+            const manageTable = document.getElementById('manage-members-table-body');
+            if (manageTable) {
+                manageTable.innerHTML = membersList.map(m => `
+                    <tr>
+                        <td><strong>${m.full_name}</strong><br><small style="color:var(--text-muted);">${m.member_id}</small></td>
+                        <td>${m.username}</td>
+                        <td>₦${m.daily_target.toLocaleString()}</td>
+                        <td>
+                            <button class="btn-edit-sm" onclick="openMemberEditModal('${m.member_id}')">Edit Profile</button>
+                        </td>
+                    </tr>
+                `).join('');
+            }
+        }
+
+        function renderMembersDirectory(list) {
             const grid = document.getElementById('members-cards-container');
             if (grid) {
-                grid.innerHTML = membersList.map(m => `
+                grid.innerHTML = list.map(m => `
                     <div class="member-card-item" onclick="openMemberEditModal('${m.member_id}')">
                         <div class="member-card-header">
                             <div class="member-avatar">${m.full_name.charAt(0)}</div>
@@ -1979,19 +2002,37 @@ INDEX_TEMPLATE = """
                     </div>
                 `).join('');
             }
+        }
 
-            const manageTable = document.getElementById('manage-members-table-body');
-            if (manageTable) {
-                manageTable.innerHTML = membersList.map(m => `
-                    <tr>
-                        <td><strong>${m.full_name}</strong><br><small>${m.member_id}</small></td>
-                        <td>${m.username}</td>
-                        <td>₦${m.daily_target.toLocaleString()}</td>
-                        <td>
-                            <button class="btn-edit-sm" onclick="openMemberEditModal('${m.member_id}')">Edit</button>
-                        </td>
-                    </tr>
+        function filterDirectoryCards() {
+            const query = document.getElementById('dir-filter-input').value.toLowerCase().trim();
+            const filtered = membersList.filter(m => 
+                m.full_name.toLowerCase().includes(query) || m.member_id.toLowerCase().includes(query)
+            );
+            renderMembersDirectory(filtered);
+        }
+
+        // ULTRA-FAST GLOBAL SEARCH BAR
+        function handleGlobalSearchInput(e) {
+            const query = e.target.value.toLowerCase().trim();
+            const dropdown = document.getElementById('search-results-dropdown');
+            if (!query) { dropdown.style.display = 'none'; return; }
+            
+            const filtered = membersList.filter(m => 
+                m.full_name.toLowerCase().includes(query) || m.member_id.toLowerCase().includes(query)
+            );
+
+            if (filtered.length > 0) {
+                dropdown.innerHTML = filtered.map(m => `
+                    <div class="search-result-item" onclick="openMemberEditModal('${m.member_id}'); document.getElementById('search-results-dropdown').style.display='none'; document.getElementById('global-search-input').value='';">
+                        <span><strong>${m.full_name}</strong> <small style="color:#64748b;">(${m.member_id})</small></span>
+                        <span style="color:var(--primary-green-dark); font-weight:800;">₦${m.net_balance.toLocaleString()}</span>
+                    </div>
                 `).join('');
+                dropdown.style.display = 'block';
+            } else {
+                dropdown.innerHTML = `<div class="search-result-item" style="color:var(--text-muted);">No member found</div>`;
+                dropdown.style.display = 'block';
             }
         }
 
@@ -2074,7 +2115,7 @@ INDEX_TEMPLATE = """
                     <td>₦${l.amount_paid.toLocaleString()}</td>
                     <td><span class="badge ${l.status === 'cleared' ? 'badge-success' : 'badge-fee'}">${l.status}</span></td>
                     <td>
-                        ${l.status === 'active' ? `<button class="btn-repay-sm" onclick="openLoanRepayModal(${l.id})">Repay</button>` : 'Cleard'}
+                        ${l.status === 'active' ? `<button class="btn-repay-sm" onclick="openLoanRepayModal(${l.id})">Repay</button>` : 'Cleared'}
                     </td>
                 </tr>
             `).join('');
@@ -2140,7 +2181,7 @@ INDEX_TEMPLATE = """
                 <tr>
                     <td><span class="badge ${l.tx_type.includes('Deposit') ? 'badge-savings' : 'badge-payout'}">${l.tx_type}</span></td>
                     <td>${l.full_name}</td>
-                    <td class="val-green">₦${l.gross_inflow.toLocaleString()}</td>
+                    <td style="color:var(--primary-green-dark); font-weight:800;">₦${l.gross_inflow.toLocaleString()}</td>
                     <td style="color:var(--amber-fee);">₦${l.service_fee.toLocaleString()}</td>
                     <td style="color:var(--primary-red);">₦${l.outflow.toLocaleString()}</td>
                 </tr>
@@ -2288,28 +2329,6 @@ INDEX_TEMPLATE = """
                 document.getElementById('new-pass').value = '';
                 goBackHome();
             } else showToast(d.message, 'error');
-        }
-
-        function handleGlobalSearchInput(e) {
-            const query = e.target.value.toLowerCase().trim();
-            const dropdown = document.getElementById('search-results-dropdown');
-            if (!query) { dropdown.style.display = 'none'; return; }
-            
-            const filtered = membersList.filter(m => 
-                m.full_name.toLowerCase().includes(query) || m.member_id.toLowerCase().includes(query)
-            );
-
-            if (filtered.length > 0) {
-                dropdown.innerHTML = filtered.map(m => `
-                    <div class="search-result-item" onclick="openMemberEditModal('${m.member_id}'); document.getElementById('search-results-dropdown').style.display='none';">
-                        <span><strong>${m.full_name}</strong> (${m.member_id})</span>
-                        <span class="val-green">₦${m.net_balance.toLocaleString()}</span>
-                    </div>
-                `).join('');
-                dropdown.style.display = 'block';
-            } else {
-                dropdown.style.display = 'none';
-            }
         }
 
         async function loadMemberPortal(memberId) {
