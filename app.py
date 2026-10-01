@@ -345,7 +345,7 @@ def manage_members():
             return jsonify({'success': False, 'message': str(e)}), 500
 
     else:
-        # HIGH-SPEED QUERY: Single query with aggregated left joins
+        # HIGH-SPEED AGGREGATED QUERY
         cursor.execute('''
             SELECT 
                 m.id, m.member_id, m.full_name, m.phone, m.email, m.username, m.daily_target,
@@ -442,7 +442,7 @@ def member_detail_update_delete(member_id):
             ''', (full_name, username, daily_target, member_id))
 
         db.commit()
-        return jsonify({'success': True, 'message': 'Member profile & credentials updated!'})
+        return jsonify({'success': True, 'message': 'Member profile updated successfully!'})
 
     else:
         cursor.execute(f'''
@@ -464,7 +464,7 @@ def member_detail_update_delete(member_id):
             SELECT id, amount, date, notes, is_service_fee, days_credited 
             FROM savings 
             WHERE member_id = {p} 
-            ORDER BY id DESC LIMIT 5
+            ORDER BY id DESC LIMIT 10
         ''', (member_id_actual,))
         savings = [dict(s) for s in cursor.fetchall()]
 
@@ -480,6 +480,7 @@ def member_detail_update_delete(member_id):
                 'cycle_days': m['cycle_days'],
                 'status': m['status'],
                 'total_saved': m['total_saved'],
+                'total_withdrawn': m['total_withdrawn'],
                 'net_balance': m['total_saved'] - m['total_withdrawn'],
                 'active_loan': m['active_loan'],
                 'total_service_fees': m['total_service_fees']
@@ -1057,7 +1058,7 @@ def index():
     return render_template_string(INDEX_TEMPLATE)
 
 # -----------------------------------------------------------------------------
-# FRONTEND TEMPLATE (FULLY RESTORED & MOBILE ENHANCED)
+# FRONTEND TEMPLATE (COMPLETE & UN-CONDENSED WITH RICH MEMBER MODAL)
 # -----------------------------------------------------------------------------
 INDEX_TEMPLATE = """
 <!DOCTYPE html>
@@ -1107,7 +1108,7 @@ INDEX_TEMPLATE = """
         .toast.error { background: var(--primary-red); }
         @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
 
-        /* FIXED NON-SCROLLABLE STICKY TOP WRAPPER */
+        /* FIXED STICKY TOP CONTAINER */
         .sticky-header-container {
             position: fixed; top: 0; left: 0; right: 0; z-index: 1000;
             background: #ffffff; border-bottom: 1.5px solid var(--border-light);
@@ -1137,7 +1138,7 @@ INDEX_TEMPLATE = """
             cursor: pointer; min-height: 38px; touch-action: manipulation;
         }
 
-        /* SEARCH BAR & FIXED STICKY BACK BUTTON ROW */
+        /* SEARCH BAR & BACK BUTTON */
         .sticky-nav-bar {
             padding: 0.25rem 1rem 0.6rem 1rem; max-width: 600px; margin: 0 auto;
             width: 100%; position: relative; display: flex; align-items: center; gap: 8px;
@@ -1154,7 +1155,7 @@ INDEX_TEMPLATE = """
         .search-wrapper { position: relative; width: 100%; flex: 1; }
         .search-wrapper i { position: absolute; left: 16px; top: 50%; transform: translateY(-50%); color: #94a3b8; font-size: 0.95rem; }
         
-        /* 16px Font size disables iPhone Auto-Zoom on focus */
+        /* 16px Font Size disables iPhone Auto-Zoom */
         .search-input {
             width: 100%; padding: 10px 16px 10px 42px; border-radius: 30px;
             border: 1.5px solid var(--border-light); font-size: 16px !important; outline: none; background: #ffffff;
@@ -1282,7 +1283,7 @@ INDEX_TEMPLATE = """
             display: flex; align-items: center; justify-content: center; gap: 4px;
         }
 
-        /* NATIVE MOBILE MODAL SLIDE-UP */
+        /* RICH MEMBER MODAL STYLING */
         .modal-overlay {
             position: fixed; top: 0; left: 0; right: 0; bottom: 0;
             background: rgba(15, 23, 42, 0.6); backdrop-filter: blur(3px);
@@ -1294,7 +1295,7 @@ INDEX_TEMPLATE = """
         .modal-overlay.active { display: flex; }
         .modal-card {
             background: #ffffff; border-radius: 24px 24px 0 0; width: 100%; max-width: 500px;
-            max-height: 85vh; overflow-y: auto; padding: 1.25rem; box-shadow: 0 -10px 25px rgba(0,0,0,0.15);
+            max-height: 88vh; overflow-y: auto; padding: 1.25rem; box-shadow: 0 -10px 25px rgba(0,0,0,0.15);
             animation: slideModal 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
             -webkit-overflow-scrolling: touch;
         }
@@ -1304,13 +1305,39 @@ INDEX_TEMPLATE = """
         @keyframes slideModal { from { transform: translateY(100%); } to { transform: translateY(0); } }
         @keyframes modalFade { from { transform: scale(0.95); opacity: 0; } to { transform: scale(1); opacity: 1; } }
 
-        .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }
-        .modal-title { font-size: 1.1rem; font-weight: 800; color: var(--text-dark); }
+        .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.85rem; }
+        .modal-title { font-size: 1.15rem; font-weight: 800; color: var(--text-dark); }
         .modal-close { background: #f1f5f9; border: none; font-size: 1.2rem; width: 32px; height: 32px; border-radius: 50%; color: var(--text-muted); cursor: pointer; display: flex; align-items: center; justify-content: center; }
+
+        .modal-nav-tabs {
+            display: flex; gap: 6px; overflow-x: auto; padding-bottom: 6px; margin-bottom: 1rem;
+            border-bottom: 1.5px solid var(--border-light); -webkit-overflow-scrolling: touch;
+        }
+        .modal-tab {
+            padding: 8px 14px; border-radius: 20px; font-size: 0.82rem; font-weight: 700;
+            border: 1.5px solid var(--border-light); cursor: pointer; white-space: nowrap; color: var(--text-muted);
+            background: #ffffff; touch-action: manipulation;
+        }
+        .modal-tab.active { background: #f0fdf4; border-color: #bbf7d0; color: var(--primary-green-dark); }
+
+        .modal-tab-panel { display: none; }
+        .modal-tab-panel.active { display: block; }
+
+        .modal-details-list { display: flex; flex-direction: column; gap: 10px; font-size: 0.9rem; margin-bottom: 1rem; }
+        .modal-detail-item { display: flex; justify-content: space-between; font-weight: 600; padding: 6px 0; border-bottom: 1px dashed var(--border-light); }
+        .modal-detail-item:last-child { border-bottom: none; }
+
+        .modal-cycle-box {
+            background: var(--purple-bg); border: 1.5px solid var(--purple-border); border-radius: 12px;
+            padding: 12px 14px; margin-bottom: 1rem; text-align: center;
+        }
+        .modal-cycle-box .lbl { font-size: 0.72rem; font-weight: 800; color: var(--purple-cycle); text-transform: uppercase; margin-bottom: 2px; }
+        .modal-cycle-box .val { font-weight: 800; color: var(--purple-cycle); font-size: 1rem; }
 
         .card-form { background: #fff; border: 1.5px solid var(--border-light); border-radius: 16px; padding: 1.1rem; }
         .form-group { display: flex; flex-direction: column; gap: 5px; margin-bottom: 0.85rem; }
         .form-group label { font-size: 0.82rem; font-weight: 700; color: var(--text-dark); }
+        
         .form-control {
             padding: 11px 12px; border-radius: 10px; border: 1.5px solid var(--border-light);
             font-size: 16px !important; outline: none; background: #fff; width: 100%; min-height: 46px;
@@ -1353,7 +1380,7 @@ INDEX_TEMPLATE = """
 
     <div id="toast-container"></div>
 
-    <!-- FIXED STICKY TOP WRAPPER -->
+    <!-- FIXED STICKY TOP CONTAINER -->
     <div class="sticky-header-container">
         <header>
             <div class="brand-box" onclick="goBackHome()">
@@ -1804,37 +1831,84 @@ INDEX_TEMPLATE = """
 
     </div>
 
-    <!-- MODAL: MEMBER DETAILS & EDIT -->
+    <!-- RICH MEMBER DETAIL MODAL (RESTORED MULTI-TAB INTERFACE) -->
     <div class="modal-overlay" id="member-detail-modal" onclick="if(event.target===this) closeModal('member-detail-modal')">
         <div class="modal-card">
             <div class="modal-header">
-                <div class="modal-title" id="md-title">Edit Member Profile</div>
+                <div>
+                    <div class="modal-title" id="md-title">Member Profile</div>
+                    <div style="font-size:0.78rem; color:var(--text-muted); font-weight:700;" id="md-subid">SVR0000</div>
+                </div>
                 <button class="modal-close" onclick="closeModal('member-detail-modal')">&times;</button>
             </div>
-            <div class="card-form">
-                <form onsubmit="handleMemberEditSubmit(event)">
-                    <input type="hidden" id="edit-member-id">
-                    <div class="form-group">
-                        <label>Full Name</label>
-                        <input type="text" class="form-control" id="edit-fullname" required>
+
+            <!-- MODAL NAVIGATION TABS -->
+            <div class="modal-nav-tabs">
+                <button class="modal-tab active" onclick="switchModalTab('md-tab-overview', this)">Overview</button>
+                <button class="modal-tab" onclick="switchModalTab('md-tab-savings', this)">Savings History</button>
+                <button class="modal-tab" onclick="switchModalTab('md-tab-edit', this)">Edit & Admin</button>
+            </div>
+
+            <!-- PANEL 1: OVERVIEW -->
+            <div class="modal-tab-panel active" id="md-tab-overview">
+                <div class="modal-cycle-box">
+                    <div class="lbl">Current Cycle Status</div>
+                    <div class="val" id="md-cycle-text">🔄 Cycle 1 (0 / 31 days)</div>
+                </div>
+                <div class="modal-details-list">
+                    <div class="modal-detail-item"><span>Total Saved:</span><span class="val-green" id="md-total-saved">₦0.00</span></div>
+                    <div class="modal-detail-item"><span>Total Withdrawn:</span><span id="md-total-withdrawn">₦0.00</span></div>
+                    <div class="modal-detail-item"><span>Net Wallet Balance:</span><span style="font-weight:800; color:var(--primary-green-dark);" id="md-net-balance">₦0.00</span></div>
+                    <div class="modal-detail-item"><span>Active Loan Outstanding:</span><span style="color:var(--primary-red); font-weight:800;" id="md-active-loan">₦0.00</span></div>
+                    <div class="modal-detail-item"><span>Service Fees Paid:</span><span style="color:var(--amber-fee); font-weight:800;" id="md-service-fees">₦0.00</span></div>
+                    <div class="modal-detail-item"><span>Daily Target Amount:</span><span style="font-weight:700;" id="md-daily-target">₦0.00</span></div>
+                </div>
+            </div>
+
+            <!-- PANEL 2: SAVINGS HISTORY -->
+            <div class="modal-tab-panel" id="md-tab-savings">
+                <div class="table-responsive">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>DATE</th>
+                                <th>AMOUNT</th>
+                                <th>CREDITED</th>
+                                <th>NOTES</th>
+                            </tr>
+                        </thead>
+                        <tbody id="md-savings-table-body"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- PANEL 3: EDIT PROFILE & ACTIONS -->
+            <div class="modal-tab-panel" id="md-tab-edit">
+                <div class="card-form">
+                    <form onsubmit="handleMemberEditSubmit(event)">
+                        <input type="hidden" id="edit-member-id">
+                        <div class="form-group">
+                            <label>Full Name</label>
+                            <input type="text" class="form-control" id="edit-fullname" required>
+                        </div>
+                        <div class="form-group">
+                            <label>Username</label>
+                            <input type="text" class="form-control" id="edit-username" required>
+                        </div>
+                        <div class="form-group">
+                            <label>Daily Target (₦)</label>
+                            <input type="number" class="form-control" id="edit-target" required>
+                        </div>
+                        <div class="form-group">
+                            <label>New Password (Optional)</label>
+                            <input type="password" class="form-control" id="edit-password" placeholder="Leave blank to keep current">
+                        </div>
+                        <button type="submit" class="btn-submit">Save Member Changes</button>
+                    </form>
+                    <div style="margin-top:12px; display:flex; gap:8px;">
+                        <button class="btn-submit" style="background:#0f172a;" onclick="resetMemberLedgerFromModal()">Reset Balance</button>
+                        <button class="btn-submit" style="background:var(--primary-red);" onclick="deleteMemberFromModal()">Delete Profile</button>
                     </div>
-                    <div class="form-group">
-                        <label>Username</label>
-                        <input type="text" class="form-control" id="edit-username" required>
-                    </div>
-                    <div class="form-group">
-                        <label>Daily Target (₦)</label>
-                        <input type="number" class="form-control" id="edit-target" required>
-                    </div>
-                    <div class="form-group">
-                        <label>New Password (Optional)</label>
-                        <input type="password" class="form-control" id="edit-password" placeholder="Leave blank to keep current">
-                    </div>
-                    <button type="submit" class="btn-submit">Save Member Changes</button>
-                </form>
-                <div style="margin-top:12px; display:flex; gap:8px;">
-                    <button class="btn-submit" style="background:#0f172a;" onclick="resetMemberLedgerFromModal()">Reset Balance</button>
-                    <button class="btn-submit" style="background:var(--primary-red);" onclick="deleteMemberFromModal()">Delete Profile</button>
                 </div>
             </div>
         </div>
@@ -1886,7 +1960,15 @@ INDEX_TEMPLATE = """
             document.getElementById(id).classList.remove('active');
         }
 
-        // Close search dropdown on click outside
+        function switchModalTab(panelId, btnEl) {
+            document.querySelectorAll('.modal-tab-panel').forEach(p => p.classList.remove('active'));
+            document.querySelectorAll('.modal-tab').forEach(b => b.classList.remove('active'));
+            
+            document.getElementById(panelId).classList.add('active');
+            btnEl.classList.add('active');
+        }
+
+        // Auto-close search dropdown on tap outside
         document.addEventListener('click', function(e) {
             const dropdown = document.getElementById('search-results-dropdown');
             const searchInput = document.getElementById('global-search-input');
@@ -1913,7 +1995,7 @@ INDEX_TEMPLATE = """
                     currentUser = data;
                     document.getElementById('header-member-count').innerText = data.total_members || 0;
                     
-                    // PRE-LOAD MEMBERS LIST IN BACKGROUND FOR IMMEDIATE SEARCH
+                    // PRE-LOAD MEMBERS LIST FOR INSTANT SEARCH
                     loadMembers();
 
                     if (data.role === 'admin') {
@@ -2012,7 +2094,7 @@ INDEX_TEMPLATE = """
                         <td>${m.username}</td>
                         <td>₦${m.daily_target.toLocaleString()}</td>
                         <td>
-                            <button class="btn-edit-sm" onclick="openMemberEditModal('${m.member_id}')">Edit Profile</button>
+                            <button class="btn-edit-sm" onclick="openMemberEditModal('${m.member_id}')">View Profile</button>
                         </td>
                     </tr>
                 `).join('');
@@ -2042,14 +2124,14 @@ INDEX_TEMPLATE = """
         }
 
         function filterDirectoryCards() {
-            const query = (document.getElementById('member-search-dir') || document.getElementById('dir-filter-input')).value.toLowerCase().trim();
+            const query = document.getElementById('member-search-dir').value.toLowerCase().trim();
             const filtered = membersList.filter(m => 
                 m.full_name.toLowerCase().includes(query) || m.member_id.toLowerCase().includes(query)
             );
             renderMembersDirectory(filtered);
         }
 
-        // ULTRA-FAST GLOBAL SEARCH BAR
+        // FAST SEARCH DROPDOWN
         function handleGlobalSearchInput(e) {
             const query = e.target.value.toLowerCase().trim();
             const dropdown = document.getElementById('search-results-dropdown');
@@ -2275,16 +2357,49 @@ INDEX_TEMPLATE = """
             }
         }
 
+        // OPEN RICH MULTI-TAB MEMBER MODAL
         async function openMemberEditModal(memberId) {
             const res = await fetch(`/api/member/${memberId}`);
             const d = await res.json();
             if (d.success) {
                 const m = d.member;
+                
+                // Header & Overview Tab
+                document.getElementById('md-title').innerText = m.full_name;
+                document.getElementById('md-subid').innerText = `Member ID: ${m.member_id}`;
+                document.getElementById('md-cycle-text').innerText = `🔄 Cycle ${m.current_cycle} (${m.cycle_days} / 31 days)`;
+                
+                document.getElementById('md-total-saved').innerText = `₦${m.total_saved.toLocaleString()}`;
+                document.getElementById('md-total-withdrawn').innerText = `₦${m.total_withdrawn.toLocaleString()}`;
+                document.getElementById('md-net-balance').innerText = `₦${m.net_balance.toLocaleString()}`;
+                document.getElementById('md-active-loan').innerText = `₦${m.active_loan.toLocaleString()}`;
+                document.getElementById('md-service-fees').innerText = `₦${m.total_service_fees.toLocaleString()}`;
+                document.getElementById('md-daily-target').innerText = `₦${m.daily_target.toLocaleString()}`;
+
+                // Recent Savings History Tab
+                const savingsTbody = document.getElementById('md-savings-table-body');
+                savingsTbody.innerHTML = d.recent_savings.map(s => `
+                    <tr>
+                        <td>${s.date}</td>
+                        <td style="color:var(--primary-green-dark); font-weight:800;">₦${s.amount.toLocaleString()}</td>
+                        <td>${s.days_credited} days</td>
+                        <td>${s.notes || '-'}</td>
+                    </tr>
+                `).join('');
+
+                // Edit Profile Tab
                 document.getElementById('edit-member-id').value = m.member_id;
                 document.getElementById('edit-fullname').value = m.full_name;
                 document.getElementById('edit-username').value = m.username;
                 document.getElementById('edit-target').value = m.daily_target;
                 document.getElementById('edit-password').value = '';
+
+                // Reset Tab Focus to "Overview"
+                document.querySelectorAll('.modal-tab-panel').forEach(p => p.classList.remove('active'));
+                document.querySelectorAll('.modal-tab').forEach(b => b.classList.remove('active'));
+                document.getElementById('md-tab-overview').classList.add('active');
+                document.querySelector('.modal-nav-tabs .modal-tab').classList.add('active');
+
                 document.getElementById('member-detail-modal').classList.add('active');
             }
         }
@@ -2384,7 +2499,7 @@ INDEX_TEMPLATE = """
                 table.innerHTML = d.recent_savings.map(s => `
                     <tr>
                         <td>${s.date}</td>
-                        <td>₦${s.amount.toLocaleString()}</td>
+                        <td style="color:var(--primary-green-dark); font-weight:800;">₦${s.amount.toLocaleString()}</td>
                         <td>${s.days_credited} days</td>
                     </tr>
                 `).join('');
