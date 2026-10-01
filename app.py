@@ -134,11 +134,27 @@ def init_db():
             )
         ''')
 
+        # REQ 10: PERMANENT ARCHIVE TABLE FOR LIFETIME TRACKING
+        cursor.execute(f'''
+            CREATE TABLE IF NOT EXISTS transaction_archives (
+                id {pk_type},
+                member_id TEXT NOT NULL,
+                full_name TEXT NOT NULL,
+                tx_type TEXT NOT NULL,
+                amount REAL NOT NULL,
+                cycle_no INTEGER DEFAULT 1,
+                date TEXT NOT NULL,
+                notes TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
         # SPEED OPTIMIZATION: Database Indexes
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_members_mid ON members(member_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_members_uname ON members(username)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_savings_mid ON savings(member_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_loans_mid ON loans(member_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_archives_mid ON transaction_archives(member_id)")
 
         db.commit()
 
@@ -162,6 +178,20 @@ def init_db():
 
 with app.app_context():
     init_db()
+
+# Helper function to archive all transactions permanently
+def archive_transaction(member_id, full_name, tx_type, amount, cycle_no, date_str, notes):
+    try:
+        db = get_db()
+        cursor = db.cursor()
+        p = query_param()
+        cursor.execute(f'''
+            INSERT INTO transaction_archives (member_id, full_name, tx_type, amount, cycle_no, date, notes)
+            VALUES ({p}, {p}, {p}, {p}, {p}, {p}, {p})
+        ''', (member_id, full_name, tx_type, amount, cycle_no, date_str, notes))
+        db.commit()
+    except Exception as e:
+        print("Archive error:", e)
 
 # -----------------------------------------------------------------------------
 # AUTHENTICATION API ENDPOINTS
@@ -210,11 +240,17 @@ def logout():
 @app.route('/api/auth/me', methods=['GET'])
 def get_current_user():
     if 'role' in session:
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute('SELECT COUNT(*) FROM members')
+        total_members = cursor.fetchone()[0]
+
         return jsonify({
             'logged_in': True,
             'role': session.get('role'),
             'member_id': session.get('member_id'),
-            'full_name': session.get('full_name')
+            'full_name': session.get('full_name'),
+            'total_members': total_members
         })
     return jsonify({'logged_in': False})
 
@@ -236,13 +272,17 @@ def get_wallet_overview():
     cursor.execute('SELECT COALESCE(SUM(amount), 0) FROM withdrawals')
     total_withdrawals = cursor.fetchone()[0]
 
+    cursor.execute('SELECT COUNT(*) FROM members')
+    total_members = cursor.fetchone()[0]
+
     net_balance = total_savings - total_withdrawals
 
     return jsonify({
         'total_savings': total_savings,
         'total_fees': total_fees,
         'net_balance': net_balance,
-        'total_withdrawals': total_withdrawals
+        'total_withdrawals': total_withdrawals,
+        'total_members': total_members
     })
 
 @app.route('/api/members', methods=['GET', 'POST'])
@@ -255,9 +295,10 @@ def manage_members():
         data = request.json or {}
         full_name = data.get('full_name', '').strip()
         
+        # REQ 6: Daily target optional (default to 500.0 if omitted/blank)
         raw_target = data.get('daily_target')
         try:
-            daily_target = float(raw_target) if raw_target not in (None, '') else 500.0
+            daily_target = float(raw_target) if raw_target not in (None, '', '0') else 500.0
         except (ValueError, TypeError):
             daily_target = 500.0
 
@@ -294,7 +335,8 @@ def manage_members():
                    m.current_cycle, m.cycle_days, m.status, m.created_at,
                    COALESCE((SELECT SUM(amount) FROM savings WHERE member_id = m.member_id AND is_service_fee = 0), 0) as total_saved,
                    COALESCE((SELECT SUM(amount) FROM withdrawals WHERE member_id = m.member_id), 0) as total_withdrawn,
-                   COALESCE((SELECT SUM(repayment_amount - amount_paid) FROM loans WHERE member_id = m.member_id AND status = 'active'), 0) as active_loan
+                   COALESCE((SELECT SUM(repayment_amount - amount_paid) FROM loans WHERE member_id = m.member_id AND status = 'active'), 0) as active_loan,
+                   COALESCE((SELECT SUM(amount) FROM service_fees WHERE member_id = m.member_id), 0) as total_service_fees
             FROM members m
             ORDER BY m.id ASC
         ''')
@@ -316,6 +358,7 @@ def manage_members():
                 'total_withdrawn': r['total_withdrawn'],
                 'net_balance': r['total_saved'] - r['total_withdrawn'],
                 'active_loan': r['active_loan'],
+                'total_service_fees': r['total_service_fees'],
                 'created_at': str(r['created_at'])
             })
         return jsonify(members)
@@ -377,7 +420,8 @@ def member_detail_update_delete(member_id):
             SELECT m.*,
                    COALESCE((SELECT SUM(amount) FROM savings WHERE member_id = m.member_id AND is_service_fee = 0), 0) as total_saved,
                    COALESCE((SELECT SUM(amount) FROM withdrawals WHERE member_id = m.member_id), 0) as total_withdrawn,
-                   COALESCE((SELECT SUM(repayment_amount - amount_paid) FROM loans WHERE member_id = m.member_id AND status = 'active'), 0) as active_loan
+                   COALESCE((SELECT SUM(repayment_amount - amount_paid) FROM loans WHERE member_id = m.member_id AND status = 'active'), 0) as active_loan,
+                   COALESCE((SELECT SUM(amount) FROM service_fees WHERE member_id = m.member_id), 0) as total_service_fees
             FROM members m WHERE m.member_id = {p}
         ''', (member_id,))
         m = cursor.fetchone()
@@ -387,7 +431,6 @@ def member_detail_update_delete(member_id):
 
         member_id_actual = m['member_id']
 
-        # FETCH LAST 5 CONTRIBUTIONS ONLY
         cursor.execute(f'''
             SELECT id, amount, date, notes, is_service_fee, days_credited 
             FROM savings 
@@ -409,10 +452,44 @@ def member_detail_update_delete(member_id):
                 'status': m['status'],
                 'total_saved': m['total_saved'],
                 'net_balance': m['total_saved'] - m['total_withdrawn'],
-                'active_loan': m['active_loan']
+                'active_loan': m['active_loan'],
+                'total_service_fees': m['total_service_fees'] # REQ 8
             },
             'recent_savings': savings
         })
+
+# REQ 9: FULL MEMBER CONTRIBUTION HISTORY
+@app.route('/api/member/<member_id>/history', methods=['GET'])
+def get_member_full_history(member_id):
+    db = get_db()
+    cursor = db.cursor()
+    p = query_param()
+
+    cursor.execute(f'SELECT full_name, daily_target, current_cycle, cycle_days FROM members WHERE member_id = {p}', (member_id,))
+    m = cursor.fetchone()
+    if not m:
+        return jsonify({'success': False, 'message': 'Member not found.'}), 404
+
+    cursor.execute(f'''
+        SELECT 'Savings' as category, amount, date, notes, days_credited, created_at 
+        FROM savings WHERE member_id = {p} AND is_service_fee = 0
+        UNION ALL
+        SELECT 'Service Fee' as category, amount, date, description as notes, 0 as days_credited, created_at 
+        FROM service_fees WHERE member_id = {p}
+        UNION ALL
+        SELECT 'Withdrawal' as category, amount, date, notes, 0 as days_credited, created_at 
+        FROM withdrawals WHERE member_id = {p}
+        ORDER BY date DESC, created_at DESC
+    ''', (member_id,))
+    
+    rows = cursor.fetchall()
+    history = [dict(r) for r in rows]
+
+    return jsonify({
+        'success': True,
+        'member': dict(m),
+        'history': history
+    })
 
 @app.route('/api/member/<member_id>/reset-ledger', methods=['POST'])
 def reset_single_member_ledger(member_id):
@@ -427,19 +504,17 @@ def reset_single_member_ledger(member_id):
 
     actual_id = m['member_id']
 
-    # Delete loan repayments associated with member's loans
+    # Delete active ledgers (Archives remain preserved for past record tracking - REQ 10)
     cursor.execute(f'''
         DELETE FROM loan_repayments 
         WHERE loan_id IN (SELECT id FROM loans WHERE member_id = {p})
     ''', (actual_id,))
 
-    # Delete all transactions for this specific member
     cursor.execute(f'DELETE FROM savings WHERE member_id = {p}', (actual_id,))
     cursor.execute(f'DELETE FROM service_fees WHERE member_id = {p}', (actual_id,))
     cursor.execute(f'DELETE FROM withdrawals WHERE member_id = {p}', (actual_id,))
     cursor.execute(f'DELETE FROM loans WHERE member_id = {p}', (actual_id,))
 
-    # Reset member cycle counters back to Cycle 1, 0 Days
     cursor.execute(f'UPDATE members SET current_cycle = 1, cycle_days = 0 WHERE member_id = {p}', (actual_id,))
 
     db.commit()
@@ -485,9 +560,7 @@ def handle_savings():
         total_days_added = 0
         fee_records = []
 
-        # CALCULATE MULTI-CYCLE SPAN & EXTRACT SERVICE FEES
         while remaining_cash > 0:
-            # 1. Pull out cycle service fee if at start of cycle (cycle_days == 0)
             if cycle_days == 0:
                 fee_deducted = min(daily_target, remaining_cash)
                 remaining_cash -= fee_deducted
@@ -502,7 +575,6 @@ def handle_savings():
                 if remaining_cash <= 0:
                     break
 
-            # 2. Compute days credited for current cycle
             days_needed = 31 - cycle_days
             max_cash_needed = days_needed * daily_target
 
@@ -519,12 +591,10 @@ def handle_savings():
             if days_bought == 0 and remaining_cash < daily_target and cycle_days > 0:
                 break
 
-            # Advance to next cycle if cycle complete
             if cycle_days >= 31:
                 current_cycle += 1
                 cycle_days = 0
 
-        # INSERT EXTRACTED SERVICE FEE RECORDS
         for f in fee_records:
             cursor.execute(f'''
                 INSERT INTO savings (member_id, amount, date, month_year, is_service_fee, days_credited, notes)
@@ -536,13 +606,18 @@ def handle_savings():
                 VALUES ({p}, {p}, {p}, {p}, {p})
             ''', (member_id, f['amount'], month_year, f['desc'], savings_date))
 
-        # INSERT ONE SINGLE BULK SAVINGS RECORD FOR NET SAVINGS
+            # REQ 10: Permanent Archive
+            archive_transaction(member_id, full_name, 'Service Fee', f['amount'], f['cycle'], savings_date, f['desc'])
+
         if total_savings_credited > 0:
             savings_note = notes or f'Bulk Contribution ({total_days_added} days)'
             cursor.execute(f'''
                 INSERT INTO savings (member_id, amount, date, month_year, is_service_fee, days_credited, notes)
                 VALUES ({p}, {p}, {p}, {p}, 0, {p}, {p})
             ''', (member_id, total_savings_credited, savings_date, month_year, total_days_added, savings_note))
+
+            # REQ 10: Permanent Archive
+            archive_transaction(member_id, full_name, 'Savings', total_savings_credited, current_cycle, savings_date, savings_note)
 
         cursor.execute(f'UPDATE members SET current_cycle = {p}, cycle_days = {p} WHERE member_id = {p}', 
                        (current_cycle, cycle_days, member_id))
@@ -619,6 +694,11 @@ def process_withdrawal():
     if not member_id or amount <= 0:
         return jsonify({'success': False, 'message': 'Select member and enter withdrawal amount.'}), 400
 
+    cursor.execute(f'SELECT full_name, current_cycle FROM members WHERE member_id = {p}', (member_id,))
+    m_info = cursor.fetchone()
+    if not m_info:
+        return jsonify({'success': False, 'message': 'Member not found.'}), 404
+
     cursor.execute(f'SELECT COALESCE(SUM(amount), 0) FROM savings WHERE member_id = {p} AND is_service_fee = 0', (member_id,))
     total_saved = cursor.fetchone()[0]
     cursor.execute(f'SELECT COALESCE(SUM(amount), 0) FROM withdrawals WHERE member_id = {p}', (member_id,))
@@ -632,6 +712,9 @@ def process_withdrawal():
         INSERT INTO withdrawals (member_id, amount, withdrawal_type, fee_deducted, date, notes)
         VALUES ({p}, {p}, {p}, 0.0, {p}, {p})
     ''', (member_id, amount, withdrawal_type, w_date, notes))
+
+    # REQ 10: Permanent Archive
+    archive_transaction(member_id, m_info['full_name'], 'Withdrawal', amount, m_info['current_cycle'], w_date, notes or f'{withdrawal_type} Payout')
 
     if withdrawal_type == 'reset':
         cursor.execute(f'''
@@ -665,10 +748,17 @@ def handle_loans():
         if not member_id or amount <= 0:
             return jsonify({'success': False, 'message': 'Select member and enter loan amount.'}), 400
 
+        cursor.execute(f'SELECT full_name, current_cycle FROM members WHERE member_id = {p}', (member_id,))
+        m_info = cursor.fetchone()
+
         cursor.execute(f'''
             INSERT INTO loans (member_id, amount, interest_rate, repayment_amount, issue_date)
             VALUES ({p}, {p}, 0.0, {p}, {p})
         ''', (member_id, amount, amount, issue_date))
+
+        # REQ 10: Permanent Archive
+        if m_info:
+            archive_transaction(member_id, m_info['full_name'], 'Loan Disbursed', amount, m_info['current_cycle'], issue_date, 'Loan Issued')
 
         db.commit()
         return jsonify({'success': True, 'message': 'Loan issued successfully!'})
@@ -702,7 +792,7 @@ def repay_loan():
     if not loan_id or amount <= 0:
         return jsonify({'success': False, 'message': 'Valid Loan ID and Repayment Amount required.'}), 400
 
-    cursor.execute(f'SELECT repayment_amount, amount_paid FROM loans WHERE id = {p}', (loan_id,))
+    cursor.execute(f'SELECT l.repayment_amount, l.amount_paid, l.member_id, m.full_name, m.current_cycle FROM loans l JOIN members m ON l.member_id = m.member_id WHERE l.id = {p}', (loan_id,))
     loan = cursor.fetchone()
     if not loan:
         return jsonify({'success': False, 'message': 'Loan record not found.'}), 404
@@ -714,35 +804,52 @@ def repay_loan():
                    (loan_id, amount, repay_date, notes))
     cursor.execute(f'UPDATE loans SET amount_paid = {p}, status = {p} WHERE id = {p}', (new_paid, status, loan_id))
 
+    # REQ 10: Permanent Archive
+    archive_transaction(loan['member_id'], loan['full_name'], 'Loan Repayment', amount, loan['current_cycle'], repay_date, notes)
+
     db.commit()
     return jsonify({'success': True, 'message': 'Loan repayment recorded!'})
 
 # -----------------------------------------------------------------------------
-# DAILY TRACKER & SERVICE FEES
+# DAILY TRACKER & SERVICE FEES (REQ 3 & 4: DATE / MONTH FILTERS)
 # -----------------------------------------------------------------------------
 @app.route('/api/tracker/daily', methods=['GET'])
 def get_daily_tracker():
     db = get_db()
     cursor = db.cursor()
+    p = query_param()
 
-    query = '''
+    selected_date = request.args.get('date', '').strip() # REQ 3 Filter
+
+    where_savings = f"WHERE s.is_service_fee = 0 AND s.date = {p}" if selected_date else "WHERE s.is_service_fee = 0"
+    where_fees = f"WHERE f.date = {p}" if selected_date else ""
+    where_repay = f"WHERE lr.date = {p}" if selected_date else ""
+    where_withdraw = f"WHERE w.date = {p}" if selected_date else ""
+    where_loans = f"WHERE l.issue_date = {p}" if selected_date else ""
+
+    params = []
+    if selected_date:
+        params = [selected_date] * 5
+
+    query = f'''
         SELECT 'Savings Contribution' as tx_type, s.date, s.member_id, m.full_name, s.amount as inflow, 0.0 as outflow, COALESCE(s.notes, 'Savings Deposit') as notes, s.created_at, s.id
-        FROM savings s JOIN members m ON s.member_id = m.member_id WHERE s.is_service_fee = 0
+        FROM savings s JOIN members m ON s.member_id = m.member_id {where_savings}
         UNION ALL
         SELECT 'Service Fee' as tx_type, f.date, f.member_id, m.full_name, f.amount as inflow, 0.0 as outflow, COALESCE(f.description, 'Service Fee') as notes, f.created_at, f.id
-        FROM service_fees f JOIN members m ON f.member_id = m.member_id
+        FROM service_fees f JOIN members m ON f.member_id = m.member_id {where_fees}
         UNION ALL
         SELECT 'Loan Repayment' as tx_type, lr.date, l.member_id, m.full_name, lr.amount as inflow, 0.0 as outflow, COALESCE(lr.notes, 'Loan Repayment') as notes, lr.created_at, lr.id
-        FROM loan_repayments lr JOIN loans l ON lr.loan_id = l.id JOIN members m ON l.member_id = m.member_id
+        FROM loan_repayments lr JOIN loans l ON lr.loan_id = l.id JOIN members m ON l.member_id = m.member_id {where_repay}
         UNION ALL
         SELECT 'Withdrawal Payout' as tx_type, w.date, w.member_id, m.full_name, 0.0 as inflow, w.amount as outflow, COALESCE(w.notes, 'Member Withdrawal') as notes, w.created_at, w.id
-        FROM withdrawals w JOIN members m ON w.member_id = m.member_id
+        FROM withdrawals w JOIN members m ON w.member_id = m.member_id {where_withdraw}
         UNION ALL
         SELECT 'Loan Disbursement' as tx_type, l.issue_date as date, l.member_id, m.full_name, 0.0 as inflow, l.amount as outflow, 'Loan Disbursed' as notes, l.created_at, l.id
-        FROM loans l JOIN members m ON l.member_id = m.member_id
+        FROM loans l JOIN members m ON l.member_id = m.member_id {where_loans}
         ORDER BY date DESC, id DESC
     '''
-    cursor.execute(query)
+    
+    cursor.execute(query, tuple(params))
     rows = cursor.fetchall()
     logs = [dict(r) for r in rows]
 
@@ -754,27 +861,52 @@ def get_daily_tracker():
         'logs': logs,
         'total_inflow': total_inflow,
         'total_outflow': total_outflow,
-        'net_cashflow': net_cashflow
+        'net_cashflow': net_cashflow,
+        'selected_date': selected_date
     })
 
 @app.route('/api/service-fees', methods=['GET'])
 def get_service_fees():
     db = get_db()
     cursor = db.cursor()
-    cursor.execute('''
-        SELECT f.*, m.full_name 
-        FROM service_fees f
-        JOIN members m ON f.member_id = m.member_id
-        ORDER BY f.date DESC, f.id DESC
-    ''')
+    p = query_param()
+
+    selected_month = request.args.get('month', '').strip() # REQ 4 Filter
+
+    if selected_month:
+        cursor.execute(f'''
+            SELECT f.*, m.full_name 
+            FROM service_fees f
+            JOIN members m ON f.member_id = m.member_id
+            WHERE f.month_year = {p}
+            ORDER BY f.date DESC, f.id DESC
+        ''', (selected_month,))
+    else:
+        cursor.execute('''
+            SELECT f.*, m.full_name 
+            FROM service_fees f
+            JOIN members m ON f.member_id = m.member_id
+            ORDER BY f.date DESC, f.id DESC
+        ''')
+
     rows = cursor.fetchall()
     fees = [dict(r) for r in rows]
     total_fees = sum(f['amount'] for f in fees)
 
     return jsonify({
         'fees': fees,
-        'total_fees': total_fees
+        'total_fees': total_fees,
+        'selected_month': selected_month
     })
+
+# REQ 10: PAST RECORDS & ARCHIVE LEDGER API
+@app.route('/api/archives', methods=['GET'])
+def get_past_records():
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute('SELECT * FROM transaction_archives ORDER BY date DESC, id DESC')
+    rows = cursor.fetchall()
+    return jsonify([dict(r) for r in rows])
 
 # -----------------------------------------------------------------------------
 # MAINTENANCE
@@ -807,7 +939,7 @@ def reset_all_ledgers():
     cursor.execute('UPDATE members SET current_cycle = 1, cycle_days = 0')
     db.commit()
 
-    return jsonify({'success': True, 'message': 'ALL system financial ledgers reset to zero! Member profiles preserved.'})
+    return jsonify({'success': True, 'message': 'ALL active financial ledgers reset to zero! Member profiles & past archive records preserved.'})
 
 @app.route('/api/admin/password', methods=['POST'])
 def update_password():
@@ -898,6 +1030,15 @@ INDEX_TEMPLATE = """
             display: flex; align-items: center; justify-content: center; font-size: 1.1rem;
         }
         header .brand-title { font-size: 1.25rem; font-weight: 800; color: var(--text-dark); letter-spacing: -0.3px; }
+        
+        /* REQ 1: Header Member Count Badge */
+        .header-controls { display: flex; align-items: center; gap: 10px; }
+        .member-count-badge {
+            background: #f1f5f9; border: 1.5px solid var(--border-light);
+            padding: 5px 10px; border-radius: 20px; font-weight: 800; font-size: 0.78rem;
+            color: var(--primary-green-dark); display: flex; align-items: center; gap: 5px;
+        }
+
         header .btn-logout {
             background: #ffffff; color: var(--text-dark); border: 1.5px solid var(--text-dark);
             padding: 6px 14px; border-radius: 20px; font-weight: 700; font-size: 0.82rem;
@@ -1004,9 +1145,10 @@ INDEX_TEMPLATE = """
             justify-content: center;
             gap: 10px;
             margin-top: 10px;
+            flex-wrap: wrap;
         }
         .grid-row-4-center .menu-card {
-            width: calc(33.333% - 6px);
+            width: calc(33.333% - 7px);
         }
 
         .overview-box {
@@ -1032,35 +1174,41 @@ INDEX_TEMPLATE = """
         }
 
         .filter-row { display: flex; gap: 8px; margin-bottom: 1rem; }
-        .filter-row input { flex: 1; padding: 10px 14px; border-radius: 12px; border: 1.5px solid var(--border-light); font-size: 0.88rem; background: #fff; }
+        .filter-row input, .filter-row select { flex: 1; padding: 10px 14px; border-radius: 12px; border: 1.5px solid var(--border-light); font-size: 0.88rem; background: #fff; }
+
+        /* REQ 5: 2-COLUMN COMPACT MEMBER DIRECTORY GRID */
+        .member-grid-2col {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+        }
 
         .member-card-item {
             background: #ffffff; border: 1.5px solid var(--border-light);
-            border-radius: 18px; padding: 1.1rem; margin-bottom: 0.85rem;
-            cursor: pointer; box-shadow: 0 2px 4px rgba(0,0,0,0.01);
+            border-radius: 14px; padding: 0.75rem; cursor: pointer;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.01); display: flex; flex-direction: column; justify-content: space-between;
         }
-        .member-card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
-        .member-avatar-group { display: flex; align-items: center; gap: 12px; }
+        .member-card-header { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
         .member-avatar {
-            width: 44px; height: 44px; border-radius: 50%; background: #d1fae5; color: #059669;
-            display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 1.2rem;
+            width: 32px; height: 32px; border-radius: 50%; background: #d1fae5; color: #059669;
+            display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 0.95rem; flex-shrink: 0;
         }
-        .member-info .name { font-size: 1.05rem; font-weight: 800; color: var(--text-dark); margin-bottom: 2px; }
-        .member-info .code { font-size: 0.85rem; color: #94a3b8; font-weight: 600; }
+        .member-info .name { font-size: 0.85rem; font-weight: 800; color: var(--text-dark); line-height: 1.2; word-break: break-word; }
+        .member-info .code { font-size: 0.72rem; color: #94a3b8; font-weight: 700; }
 
         .member-stats-box {
-            background: #f8fafc; border-radius: 12px; padding: 10px 14px;
-            display: grid; grid-template-columns: 1fr 1fr; gap: 6px;
-            font-size: 0.85rem; margin-bottom: 10px;
+            background: #f8fafc; border-radius: 8px; padding: 6px 8px;
+            display: flex; flex-direction: column; gap: 2px;
+            font-size: 0.75rem; margin-bottom: 6px;
         }
-        .stat-line { font-weight: 600; color: var(--text-dark); }
+        .stat-line { font-weight: 600; color: var(--text-dark); display: flex; justify-content: space-between; }
         .stat-line .val-green { color: var(--primary-green-dark); font-weight: 800; }
         .stat-line .val-red { color: var(--primary-red); font-weight: 800; }
 
         .cycle-status-btn {
             background: var(--purple-bg); border: 1px solid var(--purple-border); color: var(--purple-cycle);
-            padding: 8px; border-radius: 10px; text-align: center; font-weight: 700; font-size: 0.82rem;
-            display: flex; align-items: center; justify-content: center; gap: 6px;
+            padding: 5px; border-radius: 8px; text-align: center; font-weight: 700; font-size: 0.72rem;
+            display: flex; align-items: center; justify-content: center; gap: 4px;
         }
 
         /* Modals */
@@ -1166,9 +1314,15 @@ INDEX_TEMPLATE = """
             <div class="sprout-icon"><i class="fa-solid fa-leaf"></i></div>
             <div class="brand-title">Savers Growth</div>
         </div>
-        <button class="btn-logout" id="header-auth-btn" onclick="handleAuthAction()">
-            Logout
-        </button>
+        <div class="header-controls">
+            <!-- REQ 1: Total Members Count Display -->
+            <div class="member-count-badge" id="header-member-badge">
+                <i class="fa-solid fa-users"></i> <span id="header-member-count">0</span>
+            </div>
+            <button class="btn-logout" id="header-auth-btn" onclick="handleAuthAction()">
+                Logout
+            </button>
+        </div>
     </header>
 
     <!-- Search Container (Admin Only Header Search) -->
@@ -1256,6 +1410,18 @@ INDEX_TEMPLATE = """
             </div>
 
             <div class="grid-row-4-center">
+                <!-- REQ 9: Search Member Contribution History Card -->
+                <div class="menu-card" onclick="showSection('member-history')">
+                    <div class="icon-badge mint">🔎</div>
+                    <div class="card-heading">Member History</div>
+                </div>
+
+                <!-- REQ 10: Past Records Archive Card -->
+                <div class="menu-card" onclick="showSection('past-records')">
+                    <div class="icon-badge pink">📦</div>
+                    <div class="card-heading">Past Records</div>
+                </div>
+
                 <div class="menu-card" onclick="showSection('maintenance')">
                     <div class="icon-badge yellow">🛠️</div>
                     <div class="card-heading">Maintenance</div>
@@ -1282,6 +1448,11 @@ INDEX_TEMPLATE = """
                     <div class="overview-row">
                         <span>Daily Target:</span>
                         <span id="mportal-target" style="font-weight: 800;">₦0.00</span>
+                    </div>
+                    <!-- REQ 8: Display Service Fees Paid -->
+                    <div class="overview-row">
+                        <span>Service Fees Paid:</span>
+                        <span id="mportal-fees" style="font-weight: 800; color: var(--amber-fee);">₦0.00</span>
                     </div>
                     <div class="overview-divider"></div>
                     <div class="overview-row">
@@ -1344,26 +1515,28 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 3: MEMBERS DIRECTORY -->
+        <!-- VIEW 3: MEMBERS DIRECTORY (REQ 5: 2-COLUMN COMPACT GRID & BOTTOM ADD BUTTON) -->
         <div id="view-members" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">👥 Members Directory</div>
-                <div style="display: flex; gap: 8px; align-items: center;">
-                    <button class="btn-add-header" onclick="showSection('register')">
-                        <i class="fa-solid fa-user-plus"></i> Add Member
-                    </button>
-                    <button class="btn-back" onclick="showSection('home')">← Back</button>
-                </div>
+                <button class="btn-back" onclick="showSection('home')">← Back</button>
             </div>
 
             <div class="filter-row">
                 <input type="text" id="member-search-dir" placeholder="Search name or ID..." onkeyup="renderMembersDirectory()">
             </div>
 
-            <div id="members-cards-container"></div>
+            <div id="members-cards-container" class="member-grid-2col"></div>
+
+            <!-- REQ 5: Add Member Button at the Bottom -->
+            <div style="margin-top: 1.25rem;">
+                <button class="btn-submit" onclick="showSection('register')" style="display: flex; align-items: center; justify-content: center; gap: 8px;">
+                    <i class="fa-solid fa-user-plus"></i> Add New Member
+                </button>
+            </div>
         </div>
 
-        <!-- VIEW 4: RECORD SAVINGS (SEARCH-BASED SELECTION) -->
+        <!-- VIEW 4: RECORD SAVINGS -->
         <div id="view-savings" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">➕ Record Savings</div>
@@ -1396,7 +1569,7 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 5: PROCESS WITHDRAWAL -->
+        <!-- VIEW 5: PROCESS WITHDRAWAL (REQ 2: 2-DIGIT SEARCH MEMBER AUTOCOMPLETE) -->
         <div id="view-withdrawal" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">🏧 Process Withdrawal</div>
@@ -1404,9 +1577,13 @@ INDEX_TEMPLATE = """
             </div>
             <div class="card-form">
                 <form id="form-withdrawal" onsubmit="handleWithdrawalSubmit(event)">
-                    <div class="form-group">
-                        <label>Select Member</label>
-                        <select class="form-control member-select" id="withdrawal-member" required></select>
+                    <div class="form-group" style="position: relative;">
+                        <label>Search & Select Member</label>
+                        <input type="text" class="form-control" id="withdrawal-member-search" 
+                               placeholder="Type at least 2 digits or name (e.g. 01 or Sunday)..." 
+                               oninput="handleWithdrawalSearchInput(event)" autocomplete="off" required>
+                        <input type="hidden" id="withdrawal-member-id" required>
+                        <div class="search-results-dropdown" id="withdrawal-search-dropdown"></div>
                     </div>
                     <div class="form-group">
                         <label>Withdrawal Amount (₦)</label>
@@ -1453,25 +1630,31 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 7: DAILY TRACKER -->
+        <!-- VIEW 7: DAILY TRACKER (REQ 3: DATE PICKER FILTER) -->
         <div id="view-tracker" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">📊 Daily Tracker</div>
                 <button class="btn-back" onclick="showSection('home')">← Back</button>
             </div>
 
+            <!-- REQ 3: Calendar Date Filter -->
+            <div class="filter-row">
+                <input type="date" id="tracker-date-filter" onchange="loadTracker()">
+                <button class="btn-back" onclick="clearTrackerDateFilter()">Show All Days</button>
+            </div>
+
             <div class="overview-box" style="margin-bottom: 1.25rem;">
                 <div class="overview-row">
-                    <span>Total System Inflows:</span>
+                    <span>Total Inflows:</span>
                     <span class="amount-saved" id="tracker-summary-inflow">₦0.00</span>
                 </div>
                 <div class="overview-row">
-                    <span>Total System Outflows:</span>
+                    <span>Total Outflows:</span>
                     <span class="amount-fees" id="tracker-summary-outflow" style="color:var(--primary-red);">₦0.00</span>
                 </div>
                 <div class="overview-divider"></div>
                 <div class="overview-row">
-                    <span>Net Daily Cashflow:</span>
+                    <span>Net Cashflow:</span>
                     <span class="amount-net" id="tracker-summary-net">₦0.00</span>
                 </div>
             </div>
@@ -1492,11 +1675,17 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 8: MONTHLY SERVICE FEES -->
+        <!-- VIEW 8: MONTHLY SERVICE FEES (REQ 4: MONTH SELECTOR FILTER) -->
         <div id="view-service-fees" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">🏢 Monthly Service Fees</div>
                 <button class="btn-back" onclick="showSection('home')">← Back</button>
+            </div>
+
+            <!-- REQ 4: Month Dropdown / Month Picker Filter -->
+            <div class="filter-row">
+                <input type="month" id="fees-month-filter" onchange="loadServiceFees()">
+                <button class="btn-back" onclick="clearFeesMonthFilter()">Show All Months</button>
             </div>
 
             <div class="overview-box" style="margin-bottom: 1.25rem;">
@@ -1522,7 +1711,7 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 9: REGISTER MEMBER -->
+        <!-- VIEW 9: REGISTER MEMBER (REQ 6: DAILY TARGET OPTIONAL) -->
         <div id="view-register" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">🆔 Register Member</div>
@@ -1534,20 +1723,29 @@ INDEX_TEMPLATE = """
                         <label>Full Name</label>
                         <input type="text" class="form-control" id="reg-fullname" placeholder="e.g. Sunday Adebayo" required>
                     </div>
+                    <!-- REQ 6: Daily Target Field Optional -->
                     <div class="form-group">
-                        <label>Daily Target Amount (₦)</label>
-                        <input type="number" step="0.01" class="form-control" id="reg-target" placeholder="e.g. 1000" required>
+                        <label>Daily Target Amount (₦) <span style="font-weight:400; color:var(--text-muted);">(Optional - Default: ₦500)</span></label>
+                        <input type="number" step="0.01" class="form-control" id="reg-target" placeholder="e.g. 1000">
                     </div>
                     <button type="submit" class="btn-submit">Register Member</button>
                 </form>
             </div>
         </div>
 
-        <!-- VIEW 10: MANAGE MEMBERS -->
+        <!-- VIEW 10: MANAGE MEMBERS (REQ 7: SUM UP TOTAL DAILY TARGET) -->
         <div id="view-manage-members" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">⚙️ Manage Members</div>
                 <button class="btn-back" onclick="showSection('home')">← Back</button>
+            </div>
+
+            <!-- REQ 7: Sum Total Daily Target Box -->
+            <div class="overview-box" style="margin-bottom: 1.25rem; background: #e0f2fe; border-color: #bae6fd;">
+                <div class="overview-row">
+                    <span style="color: #0369a1; font-weight:800;">Total System Daily Target Sum:</span>
+                    <span style="font-size:1.2rem; font-weight:800; color:#0284c7;" id="manage-total-daily-target">₦0.00</span>
+                </div>
             </div>
 
             <div class="table-responsive">
@@ -1561,6 +1759,80 @@ INDEX_TEMPLATE = """
                         </tr>
                     </thead>
                     <tbody id="manage-members-table-body"></tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- REQ 9: SEARCH MEMBER CONTRIBUTION HISTORY VIEW -->
+        <div id="view-member-history" class="view-section">
+            <div class="view-header-row">
+                <div class="view-title-group">🔎 Member Contribution History</div>
+                <button class="btn-back" onclick="showSection('home')">← Back</button>
+            </div>
+
+            <div class="card-form" style="margin-bottom: 1.25rem;">
+                <div class="form-group" style="position: relative; margin-bottom: 0;">
+                    <label>Search Member to View Full History</label>
+                    <input type="text" class="form-control" id="history-member-search" 
+                           placeholder="Type at least 2 digits or name..." 
+                           oninput="handleHistorySearchInput(event)" autocomplete="off">
+                    <div class="search-results-dropdown" id="history-search-dropdown"></div>
+                </div>
+            </div>
+
+            <div id="history-results-container" style="display:none;">
+                <div class="overview-box" style="margin-bottom: 1rem;">
+                    <div class="overview-row">
+                        <span id="history-member-name" style="font-weight:800; font-size:1.05rem;">-</span>
+                        <span id="history-member-target" style="font-size:0.88rem; color:var(--text-muted);">-</span>
+                    </div>
+                </div>
+
+                <div class="table-responsive">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Category</th>
+                                <th>Amount (₦)</th>
+                                <th>Date</th>
+                                <th>Days</th>
+                                <th>Notes</th>
+                            </tr>
+                        </thead>
+                        <tbody id="history-table-body"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- REQ 10: PAST RECORDS ARCHIVE VIEW -->
+        <div id="view-past-records" class="view-section">
+            <div class="view-header-row">
+                <div class="view-title-group">📦 Past Records Archive</div>
+                <button class="btn-back" onclick="showSection('home')">← Back</button>
+            </div>
+
+            <p style="font-size:0.85rem; color:var(--text-muted); margin-bottom:1rem;">
+                Permanent, un-deletable audit trail of all historical member savings, fees, withdrawals, and loans across all past cycles.
+            </p>
+
+            <div class="filter-row">
+                <input type="text" id="archive-search-input" placeholder="Search member name or ID..." onkeyup="filterArchiveRecords()">
+            </div>
+
+            <div class="table-responsive">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Member</th>
+                            <th>Category</th>
+                            <th>Amount (₦)</th>
+                            <th>Cycle</th>
+                            <th>Date</th>
+                            <th>Notes</th>
+                        </tr>
+                    </thead>
+                    <tbody id="archive-table-body"></tbody>
                 </table>
             </div>
         </div>
@@ -1586,13 +1858,13 @@ INDEX_TEMPLATE = """
 
             <div class="manage-subcard" style="border-color:#fca5a5; background:#fff5f5;">
                 <div class="manage-subcard-title" style="color:var(--primary-red);">
-                    <i class="fa-solid fa-triangle-exclamation"></i> ⚠️ Reset All Financial Ledgers
+                    <i class="fa-solid fa-triangle-exclamation"></i> ⚠️ Reset Active Financial Ledgers
                 </div>
                 <p style="font-size:0.85rem; color:var(--text-muted); margin-bottom:1rem;">
-                    Clears ALL financial records. Members will remain preserved.
+                    Clears current active ledger tables. Members and past audit archive records remain fully preserved.
                 </p>
                 <button class="btn-submit" style="background:var(--primary-red);" onclick="triggerResetAllSystemLedgers()">
-                    ⚠️ Reset All Ledgers
+                    ⚠️ Reset Active Ledgers
                 </button>
             </div>
         </div>
@@ -1740,13 +2012,12 @@ INDEX_TEMPLATE = """
                     </form>
                 </div>
 
-                <!-- RESET MEMBER FINANCIAL DATA SUBCARD -->
                 <div class="manage-subcard" style="border-color:#fde68a; background:#fffbeb;">
                     <div class="manage-subcard-title" style="color:var(--amber-fee);">
                         <i class="fa-solid fa-rotate-left"></i> 🧹 Reset Member Financial Data
                     </div>
                     <p style="font-size:0.8rem; color:var(--text-muted); margin-bottom:0.75rem;">
-                        Clears all savings, withdrawals, loans, and fee logs for this member. Resets cycle back to Cycle 1 (0 days). Member profile and login credentials are preserved.
+                        Clears all active savings, withdrawals, and loan logs for this member. Cycle resets to Cycle 1 (0 days). Member profile remains intact and all history is preserved in Past Records.
                     </p>
                     <button class="btn-submit" style="background:var(--amber-fee);" onclick="triggerResetMemberLedger()">
                         Reset Member Financial Data
@@ -1758,7 +2029,7 @@ INDEX_TEMPLATE = """
                         <i class="fa-solid fa-trash"></i> 🗑️ Delete Member
                     </div>
                     <p style="font-size:0.8rem; color:var(--text-muted); margin-bottom:0.75rem;">
-                        Permanently deletes member profile and all recorded transactions.
+                        Permanently deletes member profile and all active transactions.
                     </p>
                     <button class="btn-submit" style="background:var(--primary-red);" onclick="triggerDeleteMemberCurrent()">
                         Delete Member Account
@@ -1802,11 +2073,16 @@ INDEX_TEMPLATE = """
 
     <script>
         const todayStr = new Date().toISOString().split('T')[0];
+        const currentMonthStr = todayStr.substring(0, 7);
+
         document.getElementById('savings-date').value = todayStr;
         document.getElementById('withdrawal-date').value = todayStr;
         document.getElementById('modal-save-date').value = todayStr;
+        document.getElementById('tracker-date-filter').value = todayStr;
+        document.getElementById('fees-month-filter').value = currentMonthStr;
 
         let globalMembers = [];
+        let globalArchiveLogs = [];
         let currentModalMember = null;
         let currentUser = null;
         let confirmResolver = null;
@@ -1869,19 +2145,23 @@ INDEX_TEMPLATE = """
                 if (data.logged_in) {
                     currentUser = data;
                     document.getElementById('header-auth-btn').innerText = 'Logout';
+                    document.getElementById('header-member-count').innerText = data.total_members || 0; // REQ 1
                     
                     if (data.role === 'admin') {
                         document.getElementById('admin-search-container').style.display = 'block';
+                        document.getElementById('header-member-badge').style.display = 'flex';
                         fetchAndRenderMembers();
                         showSection('home');
                     } else {
                         document.getElementById('admin-search-container').style.display = 'none';
+                        document.getElementById('header-member-badge').style.display = 'none';
                         loadMemberPrivatePortal(data.member_id);
                     }
                 } else {
                     currentUser = null;
                     document.getElementById('header-auth-btn').innerText = 'Login';
                     document.getElementById('admin-search-container').style.display = 'none';
+                    document.getElementById('header-member-badge').style.display = 'none';
                     showSection('login');
                 }
             } catch (err) {
@@ -1941,6 +2221,7 @@ INDEX_TEMPLATE = """
                 document.getElementById('mportal-id').innerText = `ID: ${m.member_id}`;
                 document.getElementById('mportal-balance').innerText = formatNaira(m.net_balance);
                 document.getElementById('mportal-target').innerText = formatNaira(m.daily_target);
+                document.getElementById('mportal-fees').innerText = formatNaira(m.total_service_fees); // REQ 8
                 document.getElementById('mportal-loan').innerText = formatNaira(m.active_loan);
                 document.getElementById('mportal-cycle').innerText = `🔄 Cycle ${m.current_cycle} (${m.cycle_days} / 31 days)`;
 
@@ -1979,6 +2260,7 @@ INDEX_TEMPLATE = """
             if (sectionId === 'loans') loadLoans();
             if (sectionId === 'tracker') loadTracker();
             if (sectionId === 'service-fees') loadServiceFees();
+            if (sectionId === 'past-records') loadPastRecords(); // REQ 10
         }
 
         async function fetchAndRenderMembers() {
@@ -1986,13 +2268,8 @@ INDEX_TEMPLATE = """
                 const res = await fetch('/api/members');
                 globalMembers = await res.json();
 
-                const selects = document.querySelectorAll('.member-select');
-                selects.forEach(select => {
-                    select.innerHTML = '<option value="">-- Select Member --</option>';
-                    globalMembers.forEach(m => {
-                        select.innerHTML += `<option value="${m.member_id}">${m.full_name} (${m.member_id}) - Bal: ${formatNaira(m.net_balance)}</option>`;
-                    });
-                });
+                // Update Header Member Count (REQ 1)
+                document.getElementById('header-member-count').innerText = globalMembers.length;
 
                 renderMembersDirectory();
             } catch (err) {
@@ -2000,6 +2277,7 @@ INDEX_TEMPLATE = """
             }
         }
 
+        /* REQ 5: COMPACT 2-COLUMN MEMBER DIRECTORY RENDER */
         function renderMembersDirectory() {
             const container = document.getElementById('members-cards-container');
             const searchVal = document.getElementById('member-search-dir').value.toLowerCase();
@@ -2011,7 +2289,7 @@ INDEX_TEMPLATE = """
             );
 
             if (filtered.length === 0) {
-                container.innerHTML = '<div style="text-align:center; padding:2rem; color:var(--text-muted);">No members found. Add your first member!</div>';
+                container.innerHTML = '<div style="grid-column: 1 / -1; text-align:center; padding:2rem; color:var(--text-muted);">No members found. Add your first member!</div>';
                 return;
             }
 
@@ -2020,38 +2298,40 @@ INDEX_TEMPLATE = """
                 container.innerHTML += `
                     <div class="member-card-item" onclick="openMemberModal('${m.member_id}')">
                         <div class="member-card-header">
-                            <div class="member-avatar-group">
-                                <div class="member-avatar">${initial}</div>
-                                <div class="member-info">
-                                    <div class="name">${m.full_name}</div>
-                                    <div class="code">${m.member_id}</div>
-                                </div>
+                            <div class="member-avatar">${initial}</div>
+                            <div class="member-info">
+                                <div class="name">${m.full_name}</div>
+                                <div class="code">${m.member_id}</div>
                             </div>
                         </div>
                         <div class="member-stats-box">
-                            <div class="stat-line">Bal: <span class="val-green">${formatNaira(m.net_balance)}</span></div>
-                            <div class="stat-line">Target: <span>${formatNaira(m.daily_target)}</span></div>
-                            <div class="stat-line">Days: <span>${m.cycle_days}</span></div>
-                            <div class="stat-line">Loan: <span class="val-red">${formatNaira(m.active_loan)}</span></div>
+                            <div class="stat-line"><span>Bal:</span> <span class="val-green">${formatNaira(m.net_balance)}</span></div>
+                            <div class="stat-line"><span>Target:</span> <span>${formatNaira(m.daily_target)}</span></div>
+                            <div class="stat-line"><span>Loan:</span> <span class="val-red">${formatNaira(m.active_loan)}</span></div>
                         </div>
                         <div class="cycle-status-btn">
-                            🔄 Cycle ${m.current_cycle} (${m.cycle_days} / 31 days)
+                            🔄 C${m.current_cycle} (${m.cycle_days}/31d)
                         </div>
                     </div>
                 `;
             });
         }
 
+        /* REQ 7: MANAGE MEMBERS + SUM TOTAL DAILY TARGET */
         function renderManageMembersTable() {
             const tbody = document.getElementById('manage-members-table-body');
             tbody.innerHTML = '';
 
+            let sumDailyTarget = 0;
+
             if (globalMembers.length === 0) {
                 tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; padding:1.5rem; color:var(--text-muted);">No registered members.</td></tr>';
+                document.getElementById('manage-total-daily-target').innerText = formatNaira(0);
                 return;
             }
 
             globalMembers.forEach(m => {
+                sumDailyTarget += parseFloat(m.daily_target || 0);
                 tbody.innerHTML += `
                     <tr>
                         <td><strong>${m.member_id}</strong></td>
@@ -2064,6 +2344,9 @@ INDEX_TEMPLATE = """
                     </tr>
                 `;
             });
+
+            // Display total sum (REQ 7)
+            document.getElementById('manage-total-daily-target').innerText = formatNaira(sumDailyTarget);
         }
 
         async function openMemberModal(memberId) {
@@ -2172,7 +2455,7 @@ INDEX_TEMPLATE = """
         }
 
         /* -------------------------------------------------------------------------
-           RECORD SAVINGS: MEMBER SEARCH FUNCTIONS
+           RECORD SAVINGS: SEARCH INPUT
         ------------------------------------------------------------------------- */
         function handleSavingsSearchInput(e) {
             const query = e.target.value.trim().toLowerCase();
@@ -2217,6 +2500,165 @@ INDEX_TEMPLATE = """
             document.getElementById('savings-search-dropdown').style.display = 'none';
         }
 
+        /* -------------------------------------------------------------------------
+           REQ 2: PROCESS WITHDRAWAL 2-DIGIT SEARCH MEMBER AUTOCOMPLETE
+        ------------------------------------------------------------------------- */
+        function handleWithdrawalSearchInput(e) {
+            const query = e.target.value.trim().toLowerCase();
+            const dropdown = document.getElementById('withdrawal-search-dropdown');
+            document.getElementById('withdrawal-member-id').value = ''; 
+            dropdown.innerHTML = '';
+
+            const digitsOnly = query.replace(/\D/g, '');
+
+            if (digitsOnly.length >= 2 || query.length >= 2) {
+                const matches = globalMembers.filter(m => 
+                    m.member_id.toLowerCase().includes(query) ||
+                    m.full_name.toLowerCase().includes(query) ||
+                    m.member_id.replace(/\D/g, '').includes(digitsOnly)
+                );
+
+                if (matches.length > 0) {
+                    dropdown.style.display = 'block';
+                    matches.forEach(m => {
+                        const safeName = m.full_name.replace(/'/g, "\\'");
+                        dropdown.innerHTML += `
+                            <div class="search-result-item" onclick="selectWithdrawalMember('${m.member_id}', '${safeName} (${m.member_id})')">
+                                <div>
+                                    <strong>${m.full_name}</strong> (${m.member_id})
+                                </div>
+                                <span style="color:var(--primary-green-dark);">${formatNaira(m.net_balance)}</span>
+                            </div>
+                        `;
+                    });
+                } else {
+                    dropdown.style.display = 'block';
+                    dropdown.innerHTML = '<div class="search-result-item" style="color:var(--text-muted);">No matching member found</div>';
+                }
+            } else {
+                dropdown.style.display = 'none';
+            }
+        }
+
+        function selectWithdrawalMember(memberId, displayName) {
+            document.getElementById('withdrawal-member-search').value = displayName;
+            document.getElementById('withdrawal-member-id').value = memberId;
+            document.getElementById('withdrawal-search-dropdown').style.display = 'none';
+        }
+
+        /* -------------------------------------------------------------------------
+           REQ 9: MEMBER HISTORY SEARCH AUTOCOMPLETE
+        ------------------------------------------------------------------------- */
+        function handleHistorySearchInput(e) {
+            const query = e.target.value.trim().toLowerCase();
+            const dropdown = document.getElementById('history-search-dropdown');
+            dropdown.innerHTML = '';
+
+            const digitsOnly = query.replace(/\D/g, '');
+
+            if (digitsOnly.length >= 2 || query.length >= 2) {
+                const matches = globalMembers.filter(m => 
+                    m.member_id.toLowerCase().includes(query) ||
+                    m.full_name.toLowerCase().includes(query) ||
+                    m.member_id.replace(/\D/g, '').includes(digitsOnly)
+                );
+
+                if (matches.length > 0) {
+                    dropdown.style.display = 'block';
+                    matches.forEach(m => {
+                        const safeName = m.full_name.replace(/'/g, "\\'");
+                        dropdown.innerHTML += `
+                            <div class="search-result-item" onclick="loadMemberContributionHistory('${m.member_id}')">
+                                <div>
+                                    <strong>${m.full_name}</strong> (${m.member_id})
+                                </div>
+                                <span style="color:var(--primary-green-dark);">${formatNaira(m.net_balance)}</span>
+                            </div>
+                        `;
+                    });
+                } else {
+                    dropdown.style.display = 'block';
+                    dropdown.innerHTML = '<div class="search-result-item" style="color:var(--text-muted);">No matching member found</div>';
+                }
+            } else {
+                dropdown.style.display = 'none';
+            }
+        }
+
+        async function loadMemberContributionHistory(memberId) {
+            document.getElementById('history-search-dropdown').style.display = 'none';
+            document.getElementById('history-member-search').value = '';
+
+            const res = await fetch(`/api/member/${memberId}/history`);
+            const data = await res.json();
+
+            if (data.success) {
+                document.getElementById('history-results-container').style.display = 'block';
+                document.getElementById('history-member-name').innerText = `${data.member.full_name} (${memberId})`;
+                document.getElementById('history-member-target').innerText = `Target: ${formatNaira(data.member.daily_target)} | C${data.member.current_cycle} (${data.member.cycle_days}/31d)`;
+
+                const tbody = document.getElementById('history-table-body');
+                tbody.innerHTML = '';
+
+                if (data.history.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; color:var(--text-muted); padding:1.5rem;">No recorded transaction history for this member.</td></tr>';
+                } else {
+                    data.history.forEach(h => {
+                        const isFee = h.category === 'Service Fee';
+                        const isWithdrawal = h.category === 'Withdrawal';
+                        tbody.innerHTML += `
+                            <tr>
+                                <td><span class="badge ${isFee ? 'badge-fee' : (isWithdrawal ? 'badge-payout' : 'badge-savings')}">${h.category}</span></td>
+                                <td style="font-weight:800; color:${isWithdrawal ? 'var(--primary-red)' : 'var(--primary-green-dark)'}">${formatNaira(h.amount)}</td>
+                                <td>${h.date}</td>
+                                <td>${h.days_credited || 0}</td>
+                                <td>${h.notes || ''}</td>
+                            </tr>
+                        `;
+                    });
+                }
+            }
+        }
+
+        /* -------------------------------------------------------------------------
+           REQ 10: PAST RECORDS ARCHIVE AUDIT TRAIL
+        ------------------------------------------------------------------------- */
+        async function loadPastRecords() {
+            const res = await fetch('/api/archives');
+            globalArchiveLogs = await res.json();
+            filterArchiveRecords();
+        }
+
+        function filterArchiveRecords() {
+            const searchVal = document.getElementById('archive-search-input').value.toLowerCase();
+            const tbody = document.getElementById('archive-table-body');
+            tbody.innerHTML = '';
+
+            const filtered = globalArchiveLogs.filter(a => 
+                a.full_name.toLowerCase().includes(searchVal) || 
+                a.member_id.toLowerCase().includes(searchVal) ||
+                a.tx_type.toLowerCase().includes(searchVal)
+            );
+
+            if (filtered.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color:var(--text-muted); padding:1.5rem;">No archive records found.</td></tr>';
+                return;
+            }
+
+            filtered.forEach(a => {
+                tbody.innerHTML += `
+                    <tr>
+                        <td><strong>${a.full_name}</strong><br><span style="font-size:0.75rem; color:var(--text-muted);">${a.member_id}</span></td>
+                        <td><span class="badge badge-savings">${a.tx_type}</span></td>
+                        <td style="font-weight:800; color:var(--primary-green-dark);">${formatNaira(a.amount)}</td>
+                        <td>Cycle ${a.cycle_no}</td>
+                        <td>${a.date}</td>
+                        <td style="font-size:0.75rem; color:var(--text-muted);">${a.notes || ''}</td>
+                    </tr>
+                `;
+            });
+        }
+
         async function deleteMemberDirect(memberId) {
             const confirmed = await showCustomConfirm("Delete Member", `Are you sure you want to permanently delete member ${memberId}?`);
             if (confirmed) {
@@ -2236,7 +2678,7 @@ INDEX_TEMPLATE = """
             if (!currentModalMember) return;
             const confirmed = await showCustomConfirm(
                 "Reset Member Financial Data", 
-                `Are you sure you want to clear all savings, withdrawals, loans, and fee logs for ${currentModalMember.full_name} (${currentModalMember.member_id})? Profile and login credentials will remain intact.`
+                `Are you sure you want to clear active ledgers for ${currentModalMember.full_name} (${currentModalMember.member_id})? Profile remains intact and all history is permanently kept in Past Records.`
             );
             if (confirmed) {
                 const res = await fetch(`/api/member/${currentModalMember.member_id}/reset-ledger`, { method: 'POST' });
@@ -2426,10 +2868,17 @@ INDEX_TEMPLATE = """
             }
         }
 
+        /* REQ 2: PROCESS WITHDRAWAL SUBMIT */
         async function handleWithdrawalSubmit(e) {
             e.preventDefault();
+            const memberId = document.getElementById('withdrawal-member-id').value;
+            if (!memberId) {
+                showToast("Please search and select a member first.", "error");
+                return;
+            }
+
             const payload = {
-                member_id: document.getElementById('withdrawal-member').value,
+                member_id: memberId,
                 amount: document.getElementById('withdrawal-amount').value,
                 withdrawal_type: document.getElementById('withdrawal-type').value,
                 date: document.getElementById('withdrawal-date').value
@@ -2445,6 +2894,9 @@ INDEX_TEMPLATE = """
             if (result.success) {
                 showToast(result.message);
                 document.getElementById('form-withdrawal').reset();
+                document.getElementById('withdrawal-member-id').value = '';
+                document.getElementById('withdrawal-search-dropdown').style.display = 'none';
+                document.getElementById('withdrawal-date').value = todayStr;
                 await fetchAndRenderMembers();
                 showSection('overview');
             } else {
@@ -2452,6 +2904,7 @@ INDEX_TEMPLATE = """
             }
         }
 
+        /* REQ 6: REGISTER MEMBER SUBMIT */
         async function handleMemberRegister(e) {
             e.preventDefault();
             const payload = {
@@ -2536,8 +2989,10 @@ INDEX_TEMPLATE = """
             }
         }
 
+        /* REQ 3: LOAD DAILY TRACKER WITH DATE FILTER */
         async function loadTracker() {
-            const res = await fetch('/api/tracker/daily');
+            const dateVal = document.getElementById('tracker-date-filter').value;
+            const res = await fetch(`/api/tracker/daily?date=${dateVal}`);
             const data = await res.json();
 
             document.getElementById('tracker-summary-inflow').innerText = formatNaira(data.total_inflow);
@@ -2548,7 +3003,7 @@ INDEX_TEMPLATE = """
             tbody.innerHTML = '';
 
             if (data.logs.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; color:var(--text-muted); padding:1.5rem;">No daily activity recorded.</td></tr>';
+                tbody.innerHTML = `<tr><td colspan="5" style="text-align:center; color:var(--text-muted); padding:1.5rem;">No activity recorded for ${dateVal || 'all dates'}.</td></tr>`;
                 return;
             }
 
@@ -2569,8 +3024,15 @@ INDEX_TEMPLATE = """
             });
         }
 
+        function clearTrackerDateFilter() {
+            document.getElementById('tracker-date-filter').value = '';
+            loadTracker();
+        }
+
+        /* REQ 4: LOAD SERVICE FEES WITH MONTH FILTER */
         async function loadServiceFees() {
-            const res = await fetch('/api/service-fees');
+            const monthVal = document.getElementById('fees-month-filter').value;
+            const res = await fetch(`/api/service-fees?month=${monthVal}`);
             const data = await res.json();
 
             document.getElementById('fees-summary-total').innerText = formatNaira(data.total_fees);
@@ -2579,7 +3041,7 @@ INDEX_TEMPLATE = """
             tbody.innerHTML = '';
 
             if (data.fees.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; color:var(--text-muted); padding:1.5rem;">No service fees collected yet.</td></tr>';
+                tbody.innerHTML = `<tr><td colspan="5" style="text-align:center; color:var(--text-muted); padding:1.5rem;">No service fees collected for ${monthVal || 'all months'}.</td></tr>`;
                 return;
             }
 
@@ -2596,6 +3058,11 @@ INDEX_TEMPLATE = """
             });
         }
 
+        function clearFeesMonthFilter() {
+            document.getElementById('fees-month-filter').value = '';
+            loadServiceFees();
+        }
+
         async function resyncLedger() {
             const res = await fetch('/api/maintenance/resync', { method: 'POST' });
             const result = await res.json();
@@ -2603,7 +3070,7 @@ INDEX_TEMPLATE = """
         }
 
         async function triggerResetAllSystemLedgers() {
-            const confirmed = await showCustomConfirm("Reset All System Ledgers", "Clear ALL financial transactions across the system? Profiles will remain preserved.");
+            const confirmed = await showCustomConfirm("Reset Active Ledgers", "Clear current active financial tables? Members and past audit archive records remain fully preserved.");
             if (confirmed) {
                 const res = await fetch('/api/maintenance/reset-all-ledgers', { method: 'POST' });
                 const result = await res.json();
@@ -2651,9 +3118,6 @@ INDEX_TEMPLATE = """
 def homepage():
     return render_template_string(INDEX_TEMPLATE)
 
-# -----------------------------------------------------------------------------
-# RUN APPLICATION
-# -----------------------------------------------------------------------------
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=True)
