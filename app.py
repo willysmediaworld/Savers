@@ -25,7 +25,7 @@ def add_months(sourcedate, months):
     return date(year, month, 1)
 
 # -----------------------------------------------------------------------------
-# DATABASE SETUP & SPEED OPTIMIZATIONS (WAL MODE + INDEXES)
+# DATABASE SETUP & SPEED OPTIMIZATIONS (WAL MODE & INDEXING)
 # -----------------------------------------------------------------------------
 def get_db():
     if 'db' not in g:
@@ -345,7 +345,7 @@ def manage_members():
             return jsonify({'success': False, 'message': str(e)}), 500
 
     else:
-        # HIGH-SPEED OPTIMIZED QUERY (Eliminates N+1 subqueries)
+        # HIGH-SPEED QUERY: Single query with aggregated left joins
         cursor.execute('''
             SELECT 
                 m.id, m.member_id, m.full_name, m.phone, m.email, m.username, m.daily_target,
@@ -442,7 +442,7 @@ def member_detail_update_delete(member_id):
             ''', (full_name, username, daily_target, member_id))
 
         db.commit()
-        return jsonify({'success': True, 'message': 'Member profile updated successfully!'})
+        return jsonify({'success': True, 'message': 'Member profile & credentials updated!'})
 
     else:
         cursor.execute(f'''
@@ -585,7 +585,7 @@ def handle_savings():
 
         # Parse payment date and FORCE baseline start to the 1st of that month
         raw_date = datetime.strptime(savings_date_str, '%Y-%m-%d').date()
-        base_date = raw_date.replace(day=1) # Strictly anchored to 1st of month
+        base_date = raw_date.replace(day=1) # Snapped strictly to 1st of month
         
         start_cycle = current_cycle
 
@@ -684,6 +684,36 @@ def handle_savings():
         ''')
         rows = cursor.fetchall()
         return jsonify([dict(r) for r in rows])
+
+@app.route('/api/savings/<int:savings_id>', methods=['DELETE'])
+def delete_savings(savings_id):
+    db = get_db()
+    cursor = db.cursor()
+    p = query_param()
+
+    cursor.execute(f'SELECT member_id, amount, is_service_fee, days_credited FROM savings WHERE id = {p}', (savings_id,))
+    row = cursor.fetchone()
+    if not row:
+        return jsonify({'success': False, 'message': 'Entry not found.'}), 404
+
+    member_id = row['member_id']
+    is_fee = row['is_service_fee']
+    days_credited = row['days_credited']
+
+    cursor.execute(f'DELETE FROM savings WHERE id = {p}', (savings_id,))
+
+    if is_fee:
+        cursor.execute(f'DELETE FROM service_fees WHERE member_id = {p} AND amount = {p}', (member_id, row['amount']))
+        cursor.execute(f'UPDATE members SET cycle_days = 0 WHERE member_id = {p}', (member_id,))
+    else:
+        cursor.execute(f'SELECT cycle_days FROM members WHERE member_id = {p}', (member_id,))
+        m = cursor.fetchone()
+        if m:
+            new_days = max(0, m['cycle_days'] - days_credited)
+            cursor.execute(f'UPDATE members SET cycle_days = {p} WHERE member_id = {p}', (new_days, member_id))
+
+    db.commit()
+    return jsonify({'success': True, 'message': 'Contribution deleted!'})
 
 # -----------------------------------------------------------------------------
 # WITHDRAWAL
@@ -1027,7 +1057,7 @@ def index():
     return render_template_string(INDEX_TEMPLATE)
 
 # -----------------------------------------------------------------------------
-# HTML/CSS/JS FRONTEND (100% MOBILE RESPONSIVE & HIGH SPEED ENGINE)
+# FRONTEND TEMPLATE (FULLY RESTORED & MOBILE ENHANCED)
 # -----------------------------------------------------------------------------
 INDEX_TEMPLATE = """
 <!DOCTYPE html>
@@ -1070,7 +1100,7 @@ INDEX_TEMPLATE = """
         .toast {
             background: #1e293b; color: #fff; padding: 12px 18px; border-radius: 12px;
             margin-bottom: 8px; box-shadow: 0 8px 20px rgba(0,0,0,0.15);
-            display: flex; align-items: center; gap: 8px; animation: slideIn 0.2s ease-out forwards;
+            display: flex; align-items: center; gap: 8px; animation: slideIn 0.25s forwards;
             font-size: 0.88rem; font-weight: 600;
         }
         .toast.success { background: var(--primary-green-dark); }
@@ -1124,17 +1154,16 @@ INDEX_TEMPLATE = """
         .search-wrapper { position: relative; width: 100%; flex: 1; }
         .search-wrapper i { position: absolute; left: 16px; top: 50%; transform: translateY(-50%); color: #94a3b8; font-size: 0.95rem; }
         
-        /* 16px Font Size strictly prevents iOS from auto-zooming on focus */
+        /* 16px Font size disables iPhone Auto-Zoom on focus */
         .search-input {
             width: 100%; padding: 10px 16px 10px 42px; border-radius: 30px;
             border: 1.5px solid var(--border-light); font-size: 16px !important; outline: none; background: #ffffff;
             appearance: none; -webkit-appearance: none;
         }
-        
         .search-results-dropdown {
             position: absolute; top: 100%; left: 0; right: 0; background: #ffffff;
             border: 1.5px solid var(--border-light); border-radius: 16px; box-shadow: 0 12px 25px rgba(0,0,0,0.15);
-            z-index: 2000; max-height: 260px; overflow-y: auto; display: none; margin-top: 6px;
+            z-index: 2500; max-height: 260px; overflow-y: auto; display: none; margin-top: 6px;
             -webkit-overflow-scrolling: touch;
         }
         .search-result-item {
@@ -1152,6 +1181,11 @@ INDEX_TEMPLATE = """
 
         .view-header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.1rem; }
         .view-title-group { display: flex; align-items: center; gap: 8px; font-size: 1.15rem; font-weight: 800; }
+        .btn-add-header {
+            background: var(--primary-green); color: #ffffff; border: none;
+            padding: 8px 14px; border-radius: 10px; font-weight: 700; font-size: 0.82rem; cursor: pointer;
+            display: flex; align-items: center; gap: 6px; touch-action: manipulation;
+        }
 
         .login-card {
             background: #ffffff; border: 1.5px solid var(--border-light);
@@ -1248,7 +1282,7 @@ INDEX_TEMPLATE = """
             display: flex; align-items: center; justify-content: center; gap: 4px;
         }
 
-        /* NATIVE MOBILE SLIDE-UP MODAL */
+        /* NATIVE MOBILE MODAL SLIDE-UP */
         .modal-overlay {
             position: fixed; top: 0; left: 0; right: 0; bottom: 0;
             background: rgba(15, 23, 42, 0.6); backdrop-filter: blur(3px);
@@ -1277,8 +1311,6 @@ INDEX_TEMPLATE = """
         .card-form { background: #fff; border: 1.5px solid var(--border-light); border-radius: 16px; padding: 1.1rem; }
         .form-group { display: flex; flex-direction: column; gap: 5px; margin-bottom: 0.85rem; }
         .form-group label { font-size: 0.82rem; font-weight: 700; color: var(--text-dark); }
-        
-        /* 16px Font Size prevents zoom */
         .form-control {
             padding: 11px 12px; border-radius: 10px; border: 1.5px solid var(--border-light);
             font-size: 16px !important; outline: none; background: #fff; width: 100%; min-height: 46px;
@@ -1321,7 +1353,7 @@ INDEX_TEMPLATE = """
 
     <div id="toast-container"></div>
 
-    <!-- FIXED STICKY TOP CONTAINER -->
+    <!-- FIXED STICKY TOP WRAPPER -->
     <div class="sticky-header-container">
         <header>
             <div class="brand-box" onclick="goBackHome()">
@@ -1336,7 +1368,7 @@ INDEX_TEMPLATE = """
             </div>
         </header>
 
-        <!-- GLOBAL SEARCH BAR & BACK BUTTON -->
+        <!-- SEARCH BAR & BACK BUTTON -->
         <div class="sticky-nav-bar" id="admin-search-container">
             <button class="btn-back-sticky" id="global-back-btn" onclick="goBackHome()">
                 <i class="fa-solid fa-arrow-left"></i> Back
@@ -1648,9 +1680,14 @@ INDEX_TEMPLATE = """
 
         <!-- VIEW 8: MEMBERS DIRECTORY -->
         <div id="view-members" class="view-section">
-            <div class="view-header-row"><div class="view-title-group">👥 Members Directory</div></div>
+            <div class="view-header-row">
+                <div class="view-title-group">👥 Members Directory</div>
+                <button class="btn-add-header" onclick="showSection('register')">
+                    <i class="fa-solid fa-user-plus"></i> Add
+                </button>
+            </div>
             <div class="filter-row">
-                <input type="text" id="dir-filter-input" placeholder="Type name or SVR code..." onkeyup="filterDirectoryCards()" autocomplete="off">
+                <input type="text" id="member-search-dir" placeholder="Search name or ID..." onkeyup="filterDirectoryCards()" autocomplete="off">
             </div>
             <div id="members-cards-container" class="member-grid-2col"></div>
         </div>
@@ -2005,7 +2042,7 @@ INDEX_TEMPLATE = """
         }
 
         function filterDirectoryCards() {
-            const query = document.getElementById('dir-filter-input').value.toLowerCase().trim();
+            const query = (document.getElementById('member-search-dir') || document.getElementById('dir-filter-input')).value.toLowerCase().trim();
             const filtered = membersList.filter(m => 
                 m.full_name.toLowerCase().includes(query) || m.member_id.toLowerCase().includes(query)
             );
