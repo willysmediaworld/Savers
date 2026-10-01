@@ -280,7 +280,7 @@ def get_wallet_overview():
     cursor = db.cursor()
 
     cursor.execute('SELECT COALESCE(SUM(amount), 0) FROM savings WHERE is_service_fee = 0')
-    total_savings = cursor.fetchone()[0]
+    net_savings_credited = cursor.fetchone()[0]
 
     cursor.execute('SELECT COALESCE(SUM(amount), 0) FROM service_fees')
     total_fees = cursor.fetchone()[0]
@@ -291,10 +291,13 @@ def get_wallet_overview():
     cursor.execute('SELECT COUNT(*) FROM members')
     total_members = cursor.fetchone()[0]
 
-    net_balance = total_savings - total_withdrawals
+    # Gross Total Saved = Net Savings Credited + Service Fees
+    gross_total_saved = net_savings_credited + total_fees
+    net_balance = net_savings_credited - total_withdrawals
 
     return jsonify({
-        'total_savings': total_savings,
+        'gross_total_saved': gross_total_saved,
+        'net_savings_credited': net_savings_credited,
         'total_fees': total_fees,
         'net_balance': net_balance,
         'total_withdrawals': total_withdrawals,
@@ -350,13 +353,13 @@ def manage_members():
             SELECT 
                 m.id, m.member_id, m.full_name, m.phone, m.email, m.username, m.daily_target,
                 m.current_cycle, m.cycle_days, m.status, m.created_at,
-                COALESCE(s.total_saved, 0) as total_saved,
+                COALESCE(s.savings_credited, 0) as savings_credited,
                 COALESCE(w.total_withdrawn, 0) as total_withdrawn,
                 COALESCE(l.active_loan, 0) as active_loan,
                 COALESCE(f.total_service_fees, 0) as total_service_fees
             FROM members m
             LEFT JOIN (
-                SELECT member_id, SUM(amount) as total_saved FROM savings WHERE is_service_fee = 0 GROUP BY member_id
+                SELECT member_id, SUM(amount) as savings_credited FROM savings WHERE is_service_fee = 0 GROUP BY member_id
             ) s ON m.member_id = s.member_id
             LEFT JOIN (
                 SELECT member_id, SUM(amount) as total_withdrawn FROM withdrawals GROUP BY member_id
@@ -372,6 +375,11 @@ def manage_members():
         rows = cursor.fetchall()
         members = []
         for r in rows:
+            savings_credited = r['savings_credited']
+            total_fees = r['total_service_fees']
+            gross_saved = savings_credited + total_fees
+            net_balance = savings_credited - r['total_withdrawn']
+
             members.append({
                 'id': r['id'],
                 'member_id': r['member_id'],
@@ -383,11 +391,13 @@ def manage_members():
                 'current_cycle': r['current_cycle'],
                 'cycle_days': r['cycle_days'],
                 'status': r['status'],
-                'total_saved': r['total_saved'],
+                'gross_saved': gross_saved,
+                'savings_credited': savings_credited,
+                'total_saved': gross_saved, # Backwards compatibility
                 'total_withdrawn': r['total_withdrawn'],
-                'net_balance': r['total_saved'] - r['total_withdrawn'],
+                'net_balance': net_balance,
                 'active_loan': r['active_loan'],
-                'total_service_fees': r['total_service_fees'],
+                'total_service_fees': total_fees,
                 'created_at': str(r['created_at'])
             })
         return jsonify(members)
@@ -447,7 +457,7 @@ def member_detail_update_delete(member_id):
     else:
         cursor.execute(f'''
             SELECT m.*,
-                   COALESCE((SELECT SUM(amount) FROM savings WHERE member_id = m.member_id AND is_service_fee = 0), 0) as total_saved,
+                   COALESCE((SELECT SUM(amount) FROM savings WHERE member_id = m.member_id AND is_service_fee = 0), 0) as savings_credited,
                    COALESCE((SELECT SUM(amount) FROM withdrawals WHERE member_id = m.member_id), 0) as total_withdrawn,
                    COALESCE((SELECT SUM(repayment_amount - amount_paid) FROM loans WHERE member_id = m.member_id AND status = 'active'), 0) as active_loan,
                    COALESCE((SELECT SUM(amount) FROM service_fees WHERE member_id = m.member_id), 0) as total_service_fees
@@ -459,8 +469,12 @@ def member_detail_update_delete(member_id):
             return jsonify({'success': False, 'message': 'Member not found.'}), 404
 
         member_id_actual = m['member_id']
+        savings_credited = m['savings_credited']
+        total_fees = m['total_service_fees']
+        gross_saved = savings_credited + total_fees
+        net_balance = savings_credited - m['total_withdrawn']
 
-        # FETCH RECENT SAVINGS CONTRIBUTIONS (EXCLUDING SERVICE FEES FOR SAVINGS LOG)
+        # FETCH RECENT SAVINGS CONTRIBUTIONS
         cursor.execute(f'''
             SELECT id, amount, date, notes, is_service_fee, days_credited 
             FROM savings 
@@ -468,6 +482,14 @@ def member_detail_update_delete(member_id):
             ORDER BY id DESC LIMIT 10
         ''', (member_id_actual,))
         savings = [dict(s) for s in cursor.fetchall()]
+
+        # FETCH ACTIVE LOANS
+        cursor.execute(f'''
+            SELECT id, amount, repayment_amount, amount_paid, status, issue_date 
+            FROM loans WHERE member_id = {p} AND status = 'active'
+            ORDER BY id DESC
+        ''', (member_id_actual,))
+        active_loans = [dict(l) for l in cursor.fetchall()]
 
         return jsonify({
             'success': True,
@@ -480,14 +502,34 @@ def member_detail_update_delete(member_id):
                 'current_cycle': m['current_cycle'],
                 'cycle_days': m['cycle_days'],
                 'status': m['status'],
-                'total_saved': m['total_saved'],
+                'gross_saved': gross_saved,
+                'total_saved': gross_saved, # Gross Total Saved
+                'savings_credited': savings_credited,
                 'total_withdrawn': m['total_withdrawn'],
-                'net_balance': m['total_saved'] - m['total_withdrawn'],
+                'net_balance': net_balance,
                 'active_loan': m['active_loan'],
-                'total_service_fees': m['total_service_fees']
+                'total_service_fees': total_fees
             },
-            'recent_savings': savings
+            'recent_savings': savings,
+            'active_loans': active_loans
         })
+
+@app.route('/api/member/<member_id>/reset-target', methods=['POST'])
+def reset_member_target(member_id):
+    db = get_db()
+    cursor = db.cursor()
+    p = query_param()
+    data = request.json or {}
+
+    try:
+        new_target = float(data.get('daily_target', 500.0))
+    except ValueError:
+        new_target = 500.0
+
+    cursor.execute(f'UPDATE members SET daily_target = {p} WHERE member_id = {p}', (new_target, member_id))
+    db.commit()
+
+    return jsonify({'success': True, 'message': f'Daily target updated to ₦{new_target:,.2f}!'})
 
 @app.route('/api/member/<member_id>/history', methods=['GET'])
 def get_member_full_history(member_id):
@@ -550,10 +592,10 @@ def reset_single_member_ledger(member_id):
     cursor.execute(f'UPDATE members SET current_cycle = 1, cycle_days = 0 WHERE member_id = {p}', (actual_id,))
 
     db.commit()
-    return jsonify({'success': True, 'message': f'Financial data for {m["full_name"]} ({actual_id}) reset successfully!'})
+    return jsonify({'success': True, 'message': f'All financial and savings history for {m["full_name"]} ({actual_id}) reset to zero!'})
 
 # -----------------------------------------------------------------------------
-# BULK SAVINGS & MULTI-MONTH SERVICE FEE SPREADING (REAL PAYMENT DATE + CYCLE 1st RULE)
+# BULK SAVINGS & MULTI-MONTH SERVICE FEE SPREADING
 # -----------------------------------------------------------------------------
 @app.route('/api/savings', methods=['GET', 'POST'])
 def handle_savings():
@@ -585,9 +627,8 @@ def handle_savings():
         cycle_days = m['cycle_days']
         daily_target = m['daily_target'] if m['daily_target'] > 0 else 500.0
 
-        # Parse payment date and FORCE baseline start to the 1st of that month for month_year cycle tracking
         raw_date = datetime.strptime(savings_date_str, '%Y-%m-%d').date()
-        base_date = raw_date.replace(day=1) # Cycle 1st baseline
+        base_date = raw_date.replace(day=1)
         
         start_cycle = current_cycle
 
@@ -597,14 +638,12 @@ def handle_savings():
         total_days_added = 0
         fee_records = []
 
-        # SPREAD SERVICE FEES ACROSS CONSECUTIVE CALENDAR MONTHS
         while remaining_cash > 0:
             if cycle_days == 0:
                 fee_deducted = min(daily_target, remaining_cash)
                 remaining_cash -= fee_deducted
                 total_fees_collected += fee_deducted
 
-                # Calculate target fee date (Always 1st of the target month for month_year)
                 month_offset = current_cycle - start_cycle
                 target_fee_date = add_months(base_date, month_offset)
                 fee_month_fmt = target_fee_date.strftime('%Y-%m')
@@ -612,7 +651,7 @@ def handle_savings():
                 fee_records.append({
                     'amount': fee_deducted,
                     'cycle': current_cycle,
-                    'date': savings_date_str, # ACTUAL PAYMENT DATE FOR DAILY TRACKER INFLOW
+                    'date': savings_date_str,
                     'month_year': fee_month_fmt,
                     'desc': f'Cycle {current_cycle} Service Fee ({fee_month_fmt})'
                 })
@@ -640,7 +679,6 @@ def handle_savings():
                 current_cycle += 1
                 cycle_days = 0
 
-        # INSERT EXTRACTED SERVICE FEES (DATED ON ACTUAL PAYMENT DAY)
         for f in fee_records:
             cursor.execute(f'''
                 INSERT INTO savings (member_id, amount, date, month_year, is_service_fee, days_credited, notes)
@@ -670,9 +708,8 @@ def handle_savings():
 
         msg = f"Processed ₦{deposit_amount:,.2f} for {full_name}! "
         if total_fees_collected > 0:
-            msg += f"₦{total_fees_collected:,.2f} extracted in service fees across concerned months. "
-        msg += f"₦{total_savings_credited:,.2f} saved in bulk ({total_days_added} days credited). "
-        msg += f"Status: Cycle {current_cycle} ({cycle_days} / 31 days)."
+            msg += f"₦{total_fees_collected:,.2f} fee extracted. "
+        msg += f"₦{total_savings_credited:,.2f} saved ({total_days_added} days credited)."
 
         return jsonify({'success': True, 'message': msg})
 
@@ -685,36 +722,6 @@ def handle_savings():
         ''')
         rows = cursor.fetchall()
         return jsonify([dict(r) for r in rows])
-
-@app.route('/api/savings/<int:savings_id>', methods=['DELETE'])
-def delete_savings(savings_id):
-    db = get_db()
-    cursor = db.cursor()
-    p = query_param()
-
-    cursor.execute(f'SELECT member_id, amount, is_service_fee, days_credited FROM savings WHERE id = {p}', (savings_id,))
-    row = cursor.fetchone()
-    if not row:
-        return jsonify({'success': False, 'message': 'Entry not found.'}), 404
-
-    member_id = row['member_id']
-    is_fee = row['is_service_fee']
-    days_credited = row['days_credited']
-
-    cursor.execute(f'DELETE FROM savings WHERE id = {p}', (savings_id,))
-
-    if is_fee:
-        cursor.execute(f'DELETE FROM service_fees WHERE member_id = {p} AND amount = {p}', (member_id, row['amount']))
-        cursor.execute(f'UPDATE members SET cycle_days = 0 WHERE member_id = {p}', (member_id,))
-    else:
-        cursor.execute(f'SELECT cycle_days FROM members WHERE member_id = {p}', (member_id,))
-        m = cursor.fetchone()
-        if m:
-            new_days = max(0, m['cycle_days'] - days_credited)
-            cursor.execute(f'UPDATE members SET cycle_days = {p} WHERE member_id = {p}', (new_days, member_id))
-
-    db.commit()
-    return jsonify({'success': True, 'message': 'Contribution deleted!'})
 
 # -----------------------------------------------------------------------------
 # WITHDRAWAL
@@ -745,13 +752,13 @@ def process_withdrawal():
         return jsonify({'success': False, 'message': 'Member not found.'}), 404
 
     cursor.execute(f'SELECT COALESCE(SUM(amount), 0) FROM savings WHERE member_id = {p} AND is_service_fee = 0', (member_id,))
-    total_saved = cursor.fetchone()[0]
+    total_saved_credited = cursor.fetchone()[0]
     cursor.execute(f'SELECT COALESCE(SUM(amount), 0) FROM withdrawals WHERE member_id = {p}', (member_id,))
     total_withdrawn = cursor.fetchone()[0]
-    current_balance = total_saved - total_withdrawn
+    current_balance = total_saved_credited - total_withdrawn
 
     if amount > current_balance:
-        return jsonify({'success': False, 'message': f'Insufficient balance! Available: ₦{current_balance:,.2f}'}), 400
+        return jsonify({'success': False, 'message': f'Insufficient balance! Available Net Balance: ₦{current_balance:,.2f}'}), 400
 
     cursor.execute(f'''
         INSERT INTO withdrawals (member_id, amount, withdrawal_type, fee_deducted, date, notes)
@@ -771,7 +778,7 @@ def process_withdrawal():
     return jsonify({'success': True, 'message': 'Withdrawal processed successfully!'})
 
 # -----------------------------------------------------------------------------
-# LOANS API
+# LOANS API (STANDALONE LOGIC - NO BALANCE RESTRICTIONS)
 # -----------------------------------------------------------------------------
 @app.route('/api/loans', methods=['GET', 'POST'])
 def handle_loans():
@@ -801,10 +808,10 @@ def handle_loans():
         ''', (member_id, amount, amount, issue_date))
 
         if m_info:
-            archive_transaction(member_id, m_info['full_name'], 'Loan Disbursed', amount, m_info['current_cycle'], issue_date, 'Loan Issued')
+            archive_transaction(member_id, m_info['full_name'], 'Loan Disbursed', amount, m_info['current_cycle'], issue_date, 'Loan Issued (Standalone)')
 
         db.commit()
-        return jsonify({'success': True, 'message': 'Loan issued successfully!'})
+        return jsonify({'success': True, 'message': f'Standalone loan of ₦{amount:,.2f} issued successfully!'})
 
     else:
         cursor.execute('''
@@ -853,7 +860,7 @@ def repay_loan():
     return jsonify({'success': True, 'message': 'Loan repayment recorded!'})
 
 # -----------------------------------------------------------------------------
-# DAILY TRACKER (STRICT SINGLE-DAY CASHFLOW FILTER)
+# DAILY TRACKER, SERVICE FEES, ARCHIVES & MAINTENANCE
 # -----------------------------------------------------------------------------
 @app.route('/api/tracker/daily', methods=['GET'])
 def get_daily_tracker():
@@ -861,7 +868,6 @@ def get_daily_tracker():
     cursor = db.cursor()
     p = query_param()
 
-    # STRICTLY DEFAULT TO TODAY IF NO DATE SELECTED
     selected_date = request.args.get('date', '').strip() or date.today().isoformat()
 
     where_savings = f"WHERE s.date = {p}"
@@ -992,37 +998,29 @@ def get_past_records():
     rows = cursor.fetchall()
     return jsonify([dict(r) for r in rows])
 
-# -----------------------------------------------------------------------------
-# MAINTENANCE
-# -----------------------------------------------------------------------------
 @app.route('/api/maintenance/resync', methods=['POST'])
 def resync_ledger():
     db = get_db()
     cursor = db.cursor()
-
     cursor.execute('''
         UPDATE loans 
         SET status = 'cleared' 
         WHERE amount_paid >= repayment_amount AND status = 'active'
     ''')
     db.commit()
-
     return jsonify({'success': True, 'message': 'Financial counters rebuild & ledger synchronization completed!'})
 
 @app.route('/api/maintenance/reset-all-ledgers', methods=['POST'])
 def reset_all_ledgers():
     db = get_db()
     cursor = db.cursor()
-
     cursor.execute('DELETE FROM savings')
     cursor.execute('DELETE FROM withdrawals')
     cursor.execute('DELETE FROM loans')
     cursor.execute('DELETE FROM loan_repayments')
     cursor.execute('DELETE FROM service_fees')
-
     cursor.execute('UPDATE members SET current_cycle = 1, cycle_days = 0')
     db.commit()
-
     return jsonify({'success': True, 'message': 'ALL active financial ledgers reset to zero! Member profiles & past archive records preserved.'})
 
 @app.route('/api/admin/password', methods=['POST'])
@@ -1057,7 +1055,7 @@ def index():
     return render_template_string(INDEX_TEMPLATE)
 
 # -----------------------------------------------------------------------------
-# FRONTEND TEMPLATE (COMPLETE & UN-CONDENSED WITH RICH MEMBER MODAL)
+# FRONTEND TEMPLATE
 # -----------------------------------------------------------------------------
 INDEX_TEMPLATE = """
 <!DOCTYPE html>
@@ -1107,7 +1105,6 @@ INDEX_TEMPLATE = """
         .toast.error { background: var(--primary-red); }
         @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
 
-        /* FIXED STICKY TOP CONTAINER */
         .sticky-header-container {
             position: fixed; top: 0; left: 0; right: 0; z-index: 1000;
             background: #ffffff; border-bottom: 1.5px solid var(--border-light);
@@ -1137,7 +1134,6 @@ INDEX_TEMPLATE = """
             cursor: pointer; min-height: 38px; touch-action: manipulation;
         }
 
-        /* SEARCH BAR & BACK BUTTON */
         .sticky-nav-bar {
             padding: 0.25rem 1rem 0.6rem 1rem; max-width: 600px; margin: 0 auto;
             width: 100%; position: relative; display: flex; align-items: center; gap: 8px;
@@ -1149,12 +1145,10 @@ INDEX_TEMPLATE = """
             display: none; align-items: center; gap: 6px; white-space: nowrap; flex-shrink: 0;
             box-shadow: 0 2px 6px rgba(0,0,0,0.12); touch-action: manipulation;
         }
-        .btn-back-sticky:active { transform: scale(0.96); }
 
         .search-wrapper { position: relative; width: 100%; flex: 1; }
         .search-wrapper i { position: absolute; left: 16px; top: 50%; transform: translateY(-50%); color: #94a3b8; font-size: 0.95rem; }
         
-        /* 16px Font Size disables iPhone Auto-Zoom */
         .search-input {
             width: 100%; padding: 10px 16px 10px 42px; border-radius: 30px;
             border: 1.5px solid var(--border-light); font-size: 16px !important; outline: none; background: #ffffff;
@@ -1170,7 +1164,6 @@ INDEX_TEMPLATE = """
             padding: 12px 16px; border-bottom: 1px solid var(--border-light); cursor: pointer;
             display: flex; justify-content: space-between; align-items: center; font-size: 0.88rem; font-weight: 600;
         }
-        .search-result-item:last-child { border-bottom: none; }
         .search-result-item:hover, .search-result-item:active { background: #f1f5f9; }
 
         .app-container { max-width: 600px; margin: 0 auto; width: 100%; padding: 1rem 1rem 2rem 1rem; flex: 1; }
@@ -1198,7 +1191,6 @@ INDEX_TEMPLATE = """
             border-radius: 50%; display: inline-flex; align-items: center; justify-content: center;
             font-size: 1.8rem; margin-bottom: 10px;
         }
-        .login-header h2 { font-size: 1.35rem; font-weight: 800; color: var(--text-dark); }
 
         .grid-3-col { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 0.4rem; }
         .menu-card {
@@ -1253,6 +1245,12 @@ INDEX_TEMPLATE = """
             font-size: 16px !important; background: #fff; outline: none;
         }
 
+        /* SEARCHABLE DROPDOWN FILTER INPUT */
+        .select-filter-input {
+            width: 100%; padding: 10px 12px; border-radius: 10px; border: 1.5px solid var(--border-light);
+            font-size: 15px !important; margin-bottom: 6px; outline: none; background: #f8fafc;
+        }
+
         .member-grid-2col { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
         .member-card-item {
             background: #ffffff; border: 1.5px solid var(--border-light);
@@ -1282,7 +1280,7 @@ INDEX_TEMPLATE = """
             display: flex; align-items: center; justify-content: center; gap: 4px;
         }
 
-        /* RICH MEMBER MODAL STYLING */
+        /* EXPANDED RICH MEMBER MODAL */
         .modal-overlay {
             position: fixed; top: 0; left: 0; right: 0; bottom: 0;
             background: rgba(15, 23, 42, 0.6); backdrop-filter: blur(3px);
@@ -1293,7 +1291,7 @@ INDEX_TEMPLATE = """
         }
         .modal-overlay.active { display: flex; }
         .modal-card {
-            background: #ffffff; border-radius: 24px 24px 0 0; width: 100%; max-width: 500px;
+            background: #ffffff; border-radius: 24px 24px 0 0; width: 100%; max-width: 520px;
             max-height: 88vh; overflow-y: auto; padding: 1.25rem; box-shadow: 0 -10px 25px rgba(0,0,0,0.15);
             animation: slideModal 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
             -webkit-overflow-scrolling: touch;
@@ -1313,7 +1311,7 @@ INDEX_TEMPLATE = """
             border-bottom: 1.5px solid var(--border-light); -webkit-overflow-scrolling: touch;
         }
         .modal-tab {
-            padding: 8px 14px; border-radius: 20px; font-size: 0.82rem; font-weight: 700;
+            padding: 8px 12px; border-radius: 20px; font-size: 0.78rem; font-weight: 700;
             border: 1.5px solid var(--border-light); cursor: pointer; white-space: nowrap; color: var(--text-muted);
             background: #ffffff; touch-action: manipulation;
         }
@@ -1322,16 +1320,16 @@ INDEX_TEMPLATE = """
         .modal-tab-panel { display: none; }
         .modal-tab-panel.active { display: block; }
 
-        .modal-details-list { display: flex; flex-direction: column; gap: 10px; font-size: 0.9rem; margin-bottom: 1rem; }
+        .modal-details-list { display: flex; flex-direction: column; gap: 10px; font-size: 0.88rem; margin-bottom: 1rem; }
         .modal-detail-item { display: flex; justify-content: space-between; font-weight: 600; padding: 6px 0; border-bottom: 1px dashed var(--border-light); }
         .modal-detail-item:last-child { border-bottom: none; }
 
         .modal-cycle-box {
             background: var(--purple-bg); border: 1.5px solid var(--purple-border); border-radius: 12px;
-            padding: 12px 14px; margin-bottom: 1rem; text-align: center;
+            padding: 10px 12px; margin-bottom: 1rem; text-align: center;
         }
         .modal-cycle-box .lbl { font-size: 0.72rem; font-weight: 800; color: var(--purple-cycle); text-transform: uppercase; margin-bottom: 2px; }
-        .modal-cycle-box .val { font-weight: 800; color: var(--purple-cycle); font-size: 1rem; }
+        .modal-cycle-box .val { font-weight: 800; color: var(--purple-cycle); font-size: 0.95rem; }
 
         .card-form { background: #fff; border: 1.5px solid var(--border-light); border-radius: 16px; padding: 1.1rem; }
         .form-group { display: flex; flex-direction: column; gap: 5px; margin-bottom: 0.85rem; }
@@ -1348,12 +1346,6 @@ INDEX_TEMPLATE = """
             touch-action: manipulation;
         }
 
-        .manage-subcard {
-            background: #f8fafc; border: 1.5px solid var(--border-light);
-            border-radius: 12px; padding: 0.85rem; margin-bottom: 0.85rem;
-        }
-        .manage-subcard-title { font-size: 0.88rem; font-weight: 800; margin-bottom: 0.6rem; display: flex; align-items: center; gap: 6px; }
-
         .table-responsive { overflow-x: auto; border-radius: 12px; border: 1.5px solid var(--border-light); -webkit-overflow-scrolling: touch; }
         table { width: 100%; border-collapse: collapse; text-align: left; font-size: 0.82rem; white-space: nowrap; }
         th, td { padding: 10px 12px; border-bottom: 1px solid var(--border-light); }
@@ -1365,8 +1357,8 @@ INDEX_TEMPLATE = """
         .badge-payout { background: #fee2e2; color: #991b1b; }
         .badge-success { background: #d1fae5; color: #065f46; }
 
-        .btn-edit-sm { background: #2563eb; color: white; border: none; padding: 6px 12px; border-radius: 6px; font-size: 0.75rem; font-weight: 700; cursor: pointer; touch-action: manipulation; }
         .btn-repay-sm { background: var(--primary-green-dark); color: white; border: none; padding: 6px 12px; border-radius: 6px; font-size: 0.75rem; font-weight: 700; cursor: pointer; touch-action: manipulation; }
+        .input-inline-table { padding: 6px 8px; border-radius: 6px; border: 1px solid var(--border-light); font-size: 14px !important; width: 100%; max-width: 130px; }
 
         footer {
             background: #ffffff; color: var(--text-dark); text-align: center;
@@ -1379,7 +1371,6 @@ INDEX_TEMPLATE = """
 
     <div id="toast-container"></div>
 
-    <!-- FIXED STICKY TOP CONTAINER -->
     <div class="sticky-header-container">
         <header>
             <div class="brand-box" onclick="goBackHome()">
@@ -1394,7 +1385,6 @@ INDEX_TEMPLATE = """
             </div>
         </header>
 
-        <!-- SEARCH BAR & BACK BUTTON -->
         <div class="sticky-nav-bar" id="admin-search-container">
             <button class="btn-back-sticky" id="global-back-btn" onclick="goBackHome()">
                 <i class="fa-solid fa-arrow-left"></i> Back
@@ -1403,7 +1393,7 @@ INDEX_TEMPLATE = """
             <div class="search-wrapper">
                 <i class="fa-solid fa-magnifying-glass"></i>
                 <input type="text" class="search-input" id="global-search-input" 
-                       placeholder="Search member name or ID..." 
+                       placeholder="Search name or digit (e.g. 01, 12, SVR)..." 
                        autocomplete="off"
                        oninput="handleGlobalSearchInput(event)">
             </div>
@@ -1413,7 +1403,7 @@ INDEX_TEMPLATE = """
 
     <div class="app-container">
 
-        <!-- VIEW 0: LOGIN SCREEN -->
+        <!-- LOGIN -->
         <div id="view-login" class="view-section">
             <div class="login-card">
                 <div class="login-header">
@@ -1435,7 +1425,7 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 1: ADMIN HOMEPAGE GRID -->
+        <!-- ADMIN HOMEPAGE -->
         <div id="view-home" class="view-section">
             <div class="grid-3-col">
                 <div class="menu-card" onclick="showSection('overview')">
@@ -1507,7 +1497,7 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 1B: MEMBER PRIVATE PORTAL -->
+        <!-- MEMBER PORTAL -->
         <div id="view-member-portal" class="view-section">
             <div style="background: #ffffff; border: 1.5px solid var(--border-light); border-radius: 20px; padding: 1.25rem;">
                 <div style="font-size: 1.2rem; font-weight: 800; color: var(--text-dark);" id="mportal-name">Welcome Member</div>
@@ -1515,8 +1505,12 @@ INDEX_TEMPLATE = """
 
                 <div class="overview-box" style="margin-top: 1rem; margin-bottom: 1rem;">
                     <div class="overview-row">
-                        <span>Savings Balance:</span>
-                        <span class="amount-saved" id="mportal-balance">₦0.00</span>
+                        <span>Gross Total Saved:</span>
+                        <span class="amount-saved" id="mportal-gross-saved">₦0.00</span>
+                    </div>
+                    <div class="overview-row">
+                        <span>Net Wallet Balance:</span>
+                        <span class="amount-net" id="mportal-balance">₦0.00</span>
                     </div>
                     <div class="overview-row">
                         <span>Daily Target:</span>
@@ -1527,13 +1521,10 @@ INDEX_TEMPLATE = """
                         <span id="mportal-fees" style="font-weight: 800; color: var(--amber-fee);">₦0.00</span>
                     </div>
                     <div class="overview-divider"></div>
-                    <div class="overview-row">
-                        <span>Active Loan:</span>
-                        <span style="color: var(--primary-red); font-weight: 800;" id="mportal-loan">₦0.00</span>
-                    </div>
+                    <div class="overview-row"><span>Active Loan (Standalone):</span><span style="color: var(--primary-red); font-weight: 800;" id="mportal-loan">₦0.00</span></div>
                 </div>
 
-                <div style="font-size: 0.95rem; font-weight: 800; margin-bottom: 8px;">My Recent Savings</div>
+                <div style="font-size: 0.95rem; font-weight: 800; margin-bottom: 8px;">My Savings Contributions</div>
                 <div class="table-responsive">
                     <table>
                         <thead>
@@ -1549,11 +1540,11 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 2: OVERVIEW -->
+        <!-- OVERVIEW -->
         <div id="view-overview" class="view-section">
             <div class="view-header-row"><div class="view-title-group">👛 Wallet Overview</div></div>
             <div class="overview-box">
-                <div class="overview-row"><span>Total Money Saved:</span><span class="amount-saved" id="stat-total-saved">₦0.00</span></div>
+                <div class="overview-row"><span>Gross Total Money Saved:</span><span class="amount-saved" id="stat-total-saved">₦0.00</span></div>
                 <div class="overview-row"><span>Total Service Fees Deducted:</span><span class="amount-fees" id="stat-service-fees">₦0.00</span></div>
                 <div class="overview-divider"></div>
                 <div class="overview-row"><span>Net Wallet Balance:</span><span class="amount-net" id="stat-net-balance">₦0.00</span></div>
@@ -1564,13 +1555,14 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 3: SAVINGS FORM -->
+        <!-- SAVINGS FORM -->
         <div id="view-savings" class="view-section">
             <div class="view-header-row"><div class="view-title-group">➕ Record Contribution</div></div>
             <div class="card-form">
                 <form onsubmit="handleSavingsSubmit(event)">
                     <div class="form-group">
-                        <label>Select Member</label>
+                        <label>Select Member (Type 2 digits to search)</label>
+                        <input type="text" class="select-filter-input" placeholder="Type member name or digit (e.g. 01, 12)..." onkeyup="filterSelectOptions('savings-member-select', this.value)">
                         <select class="form-control" id="savings-member-select" required></select>
                     </div>
                     <div class="form-group">
@@ -1590,13 +1582,14 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 4: WITHDRAWAL FORM -->
+        <!-- WITHDRAWAL FORM -->
         <div id="view-withdrawal" class="view-section">
             <div class="view-header-row"><div class="view-title-group">💸 Process Withdrawal</div></div>
             <div class="card-form">
                 <form onsubmit="handleWithdrawalSubmit(event)">
                     <div class="form-group">
-                        <label>Select Member</label>
+                        <label>Select Member (Type 2 digits to search)</label>
+                        <input type="text" class="select-filter-input" placeholder="Type member name or digit (e.g. 01, 12)..." onkeyup="filterSelectOptions('withdraw-member-select', this.value)">
                         <select class="form-control" id="withdraw-member-select" required></select>
                     </div>
                     <div class="form-group">
@@ -1612,18 +1605,20 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 5: LOANS -->
+        <!-- LOANS -->
         <div id="view-loans" class="view-section">
-            <div class="view-header-row"><div class="view-title-group">💳 Loan Management</div></div>
+            <div class="view-header-row"><div class="view-title-group">💳 Standalone Loan Management</div></div>
+            <p style="font-size:0.8rem; color:var(--text-muted); margin-bottom:12px;">* Loans do not restrict or alter savings wallet balance.</p>
             <div class="card-form" style="margin-bottom: 1.2rem;">
                 <form onsubmit="handleLoanIssueSubmit(event)">
                     <div class="form-group">
-                        <label>Select Member</label>
+                        <label>Select Member (Type 2 digits to search)</label>
+                        <input type="text" class="select-filter-input" placeholder="Type member name or digit (e.g. 01, 12)..." onkeyup="filterSelectOptions('loan-member-select', this.value)">
                         <select class="form-control" id="loan-member-select" required></select>
                     </div>
                     <div class="form-group">
                         <label>Loan Amount (₦)</label>
-                        <input type="number" class="form-control" id="loan-amount" placeholder="e.g. 20000" required>
+                        <input type="number" class="form-control" id="loan-amount" placeholder="e.g. 50000" required>
                     </div>
                     <div class="form-group">
                         <label>Disbursement Date</label>
@@ -1649,7 +1644,7 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 6: DAILY TRACKER -->
+        <!-- DAILY TRACKER -->
         <div id="view-tracker" class="view-section">
             <div class="view-header-row"><div class="view-title-group">📊 Daily Financial Ledger</div></div>
             <div class="filter-row">
@@ -1679,7 +1674,7 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 7: MONTHLY SERVICE FEES -->
+        <!-- MONTHLY SERVICE FEES -->
         <div id="view-service-fees" class="view-section">
             <div class="view-header-row"><div class="view-title-group">🏢 Monthly Service Fees</div></div>
             <div class="filter-row">
@@ -1704,7 +1699,7 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 8: MEMBERS DIRECTORY -->
+        <!-- MEMBERS DIRECTORY -->
         <div id="view-members" class="view-section">
             <div class="view-header-row">
                 <div class="view-title-group">👥 Members Directory</div>
@@ -1713,12 +1708,19 @@ INDEX_TEMPLATE = """
                 </button>
             </div>
             <div class="filter-row">
-                <input type="text" id="member-search-dir" placeholder="Search name, SVR code, or number..." onkeyup="filterDirectoryCards()" autocomplete="off">
+                <input type="text" id="member-search-dir" placeholder="Search name or digit (e.g. 01, 12)..." onkeyup="filterDirectoryCards()" autocomplete="off">
             </div>
             <div id="members-cards-container" class="member-grid-2col"></div>
+
+            <!-- DUPLICATE ADD MEMBER BUTTON AT BOTTOM OF DIRECTORY -->
+            <div style="margin-top: 1.5rem; text-align: center;">
+                <button class="btn-submit" style="background: var(--primary-green-dark);" onclick="showSection('register')">
+                    <i class="fa-solid fa-user-plus"></i> Register New Member
+                </button>
+            </div>
         </div>
 
-        <!-- VIEW 9: REGISTER MEMBER -->
+        <!-- REGISTER MEMBER -->
         <div id="view-register" class="view-section">
             <div class="view-header-row"><div class="view-title-group">🆔 Register New Member</div></div>
             <div class="card-form">
@@ -1736,17 +1738,30 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 10: MANAGE MEMBERS -->
+        <!-- MANAGE MEMBERS (WITH TARGET SUM & FULL EDITING) -->
         <div id="view-manage-members" class="view-section">
             <div class="view-header-row"><div class="view-title-group">⚙️ Manage Member Profiles</div></div>
+            
+            <div class="overview-box" style="margin-bottom: 1rem; background: #e0f2fe; border-color: #bae6fd;">
+                <div class="overview-row">
+                    <span>Total Active Members:</span>
+                    <span id="manage-total-count" style="font-weight:800;">0</span>
+                </div>
+                <div class="overview-row">
+                    <span>Sum of Daily Targets:</span>
+                    <span id="manage-target-sum" style="font-weight:800; color:var(--primary-green-dark); font-size:1.15rem;">₦0.00</span>
+                </div>
+            </div>
+
             <div class="table-responsive">
                 <table>
                     <thead>
                         <tr>
                             <th>MEMBER</th>
                             <th>USERNAME</th>
-                            <th>TARGET</th>
-                            <th>ACTIONS</th>
+                            <th>TARGET (₦)</th>
+                            <th>PASSWORD</th>
+                            <th>ACTION</th>
                         </tr>
                     </thead>
                     <tbody id="manage-members-table-body"></tbody>
@@ -1754,11 +1769,12 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 11: MEMBER HISTORY -->
+        <!-- MEMBER HISTORY -->
         <div id="view-member-history" class="view-section">
             <div class="view-header-row"><div class="view-title-group">🔎 Member Search History</div></div>
             <div class="form-group">
-                <label>Select Member</label>
+                <label>Select Member (Type 2 digits to search)</label>
+                <input type="text" class="select-filter-input" placeholder="Type member name or digit (e.g. 01, 12)..." onkeyup="filterSelectOptions('history-member-select', this.value)">
                 <select class="form-control" id="history-member-select" onchange="loadMemberHistoryView()"></select>
             </div>
             <div class="table-responsive" style="margin-top: 1rem;">
@@ -1776,7 +1792,7 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 12: PAST RECORDS -->
+        <!-- PAST RECORDS -->
         <div id="view-past-records" class="view-section">
             <div class="view-header-row"><div class="view-title-group">📦 Past Transaction Archives</div></div>
             <div class="table-responsive">
@@ -1795,22 +1811,22 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- VIEW 13: MAINTENANCE -->
+        <!-- MAINTENANCE -->
         <div id="view-maintenance" class="view-section">
             <div class="view-header-row"><div class="view-title-group">🛠️ System Maintenance</div></div>
-            <div class="manage-subcard">
-                <div class="manage-subcard-title"><i class="fa-solid fa-rotate"></i> Synchronize System Counters</div>
-                <p style="font-size:0.8rem; color:var(--text-muted); margin-bottom:10px;">Re-evaluates active loan states and balances across all tables.</p>
+            <div class="card-form" style="margin-bottom: 1rem;">
+                <div style="font-weight:800; margin-bottom:6px;"><i class="fa-solid fa-rotate"></i> Synchronize System Counters</div>
+                <p style="font-size:0.8rem; color:var(--text-muted); margin-bottom:10px;">Re-evaluates loan status and synchronization counters across tables.</p>
                 <button class="btn-submit" onclick="triggerMaintenanceResync()">Resync All Ledgers</button>
             </div>
-            <div class="manage-subcard" style="border-color: #fca5a5;">
-                <div class="manage-subcard-title" style="color:var(--primary-red);"><i class="fa-solid fa-triangle-exclamation"></i> Emergency Ledger Reset</div>
-                <p style="font-size:0.8rem; color:var(--text-muted); margin-bottom:10px;">Wipes active financial ledger transactions. Preserves member profiles and past archives.</p>
+            <div class="card-form" style="border-color: #fca5a5;">
+                <div style="font-weight:800; color:var(--primary-red); margin-bottom:6px;"><i class="fa-solid fa-triangle-exclamation"></i> Emergency Ledger Reset</div>
+                <p style="font-size:0.8rem; color:var(--text-muted); margin-bottom:10px;">Wipes active financial ledger transactions. Member profiles and past archives are preserved.</p>
                 <button class="btn-submit" style="background:var(--primary-red);" onclick="triggerMaintenanceFullReset()">Reset Active Ledgers</button>
             </div>
         </div>
 
-        <!-- VIEW 14: PASSWORD CHANGE -->
+        <!-- PASSWORD CHANGE -->
         <div id="view-password" class="view-section">
             <div class="view-header-row"><div class="view-title-group">🔐 Update Admin Password</div></div>
             <div class="card-form">
@@ -1830,7 +1846,7 @@ INDEX_TEMPLATE = """
 
     </div>
 
-    <!-- RICH MEMBER DETAIL MODAL (RESTORED MULTI-TAB INTERFACE & RECENT CONTRIBUTIONS) -->
+    <!-- 360-DEGREE EXPANDED MEMBER MODAL HUB -->
     <div class="modal-overlay" id="member-detail-modal" onclick="if(event.target===this) closeModal('member-detail-modal')">
         <div class="modal-card">
             <div class="modal-header">
@@ -1841,32 +1857,31 @@ INDEX_TEMPLATE = """
                 <button class="modal-close" onclick="closeModal('member-detail-modal')">&times;</button>
             </div>
 
-            <!-- MODAL NAVIGATION TABS -->
+            <!-- MODAL TABS -->
             <div class="modal-nav-tabs">
                 <button class="modal-tab active" onclick="switchModalTab('md-tab-overview', this)">Overview</button>
-                <button class="modal-tab" onclick="switchModalTab('md-tab-savings', this)">Savings History</button>
-                <button class="modal-tab" onclick="switchModalTab('md-tab-edit', this)">Edit & Admin</button>
+                <button class="modal-tab" onclick="switchModalTab('md-tab-savings', this)">Record Save</button>
+                <button class="modal-tab" onclick="switchModalTab('md-tab-withdraw', this)">Withdrawal</button>
+                <button class="modal-tab" onclick="switchModalTab('md-tab-loans', this)">Loans</button>
+                <button class="modal-tab" onclick="switchModalTab('md-tab-edit', this)">Settings & Admin</button>
             </div>
 
-            <!-- PANEL 1: OVERVIEW -->
+            <!-- TAB 1: OVERVIEW -->
             <div class="modal-tab-panel active" id="md-tab-overview">
                 <div class="modal-cycle-box">
                     <div class="lbl">Current Cycle Status</div>
                     <div class="val" id="md-cycle-text">🔄 Cycle 1 (0 / 31 days)</div>
                 </div>
                 <div class="modal-details-list">
-                    <div class="modal-detail-item"><span>Total Saved:</span><span class="val-green" id="md-total-saved">₦0.00</span></div>
-                    <div class="modal-detail-item"><span>Total Withdrawn:</span><span id="md-total-withdrawn">₦0.00</span></div>
+                    <div class="modal-detail-item"><span>Gross Total Saved:</span><span class="val-green" id="md-gross-saved">₦0.00</span></div>
                     <div class="modal-detail-item"><span>Net Wallet Balance:</span><span style="font-weight:800; color:var(--primary-green-dark);" id="md-net-balance">₦0.00</span></div>
-                    <div class="modal-detail-item"><span>Active Loan Outstanding:</span><span style="color:var(--primary-red); font-weight:800;" id="md-active-loan">₦0.00</span></div>
+                    <div class="modal-detail-item"><span>Total Withdrawn:</span><span id="md-total-withdrawn">₦0.00</span></div>
                     <div class="modal-detail-item"><span>Service Fees Paid:</span><span style="color:var(--amber-fee); font-weight:800;" id="md-service-fees">₦0.00</span></div>
+                    <div class="modal-detail-item"><span>Active Loan (Standalone):</span><span style="color:var(--primary-red); font-weight:800;" id="md-active-loan">₦0.00</span></div>
                     <div class="modal-detail-item"><span>Daily Target Amount:</span><span style="font-weight:700;" id="md-daily-target">₦0.00</span></div>
                 </div>
 
-                <!-- RECENT CONTRIBUTIONS HISTORY IN MODAL OVERVIEW -->
-                <div style="font-size: 0.9rem; font-weight: 800; margin: 12px 0 6px 0; color: var(--text-dark);">
-                    Recent Contributions History
-                </div>
+                <div style="font-size: 0.88rem; font-weight: 800; margin: 10px 0 6px 0;">Recent Savings History</div>
                 <div class="table-responsive">
                     <table>
                         <thead>
@@ -1874,7 +1889,6 @@ INDEX_TEMPLATE = """
                                 <th>DATE</th>
                                 <th>AMOUNT</th>
                                 <th>DAYS</th>
-                                <th>NOTES</th>
                             </tr>
                         </thead>
                         <tbody id="md-recent-contributions-body"></tbody>
@@ -1882,24 +1896,75 @@ INDEX_TEMPLATE = """
                 </div>
             </div>
 
-            <!-- PANEL 2: SAVINGS HISTORY TAB -->
+            <!-- TAB 2: IN-MODAL RECORD SAVINGS -->
             <div class="modal-tab-panel" id="md-tab-savings">
+                <div class="card-form">
+                    <form onsubmit="handleModalSavingsSubmit(event)">
+                        <div class="form-group">
+                            <label>Deposit Amount (₦)</label>
+                            <input type="number" class="form-control" id="mmodal-savings-amount" required placeholder="5000">
+                        </div>
+                        <div class="form-group">
+                            <label>Deposit Date</label>
+                            <input type="date" class="form-control" id="mmodal-savings-date" required>
+                        </div>
+                        <div class="form-group">
+                            <label>Notes</label>
+                            <input type="text" class="form-control" id="mmodal-savings-notes" placeholder="e.g. Deposit via modal">
+                        </div>
+                        <button type="submit" class="btn-submit">Record Deposit</button>
+                    </form>
+                </div>
+            </div>
+
+            <!-- TAB 3: IN-MODAL WITHDRAWAL -->
+            <div class="modal-tab-panel" id="md-tab-withdraw">
+                <div class="card-form">
+                    <form onsubmit="handleModalWithdrawSubmit(event)">
+                        <div class="form-group">
+                            <label>Withdrawal Amount (₦)</label>
+                            <input type="number" class="form-control" id="mmodal-withdraw-amount" required placeholder="10000">
+                        </div>
+                        <div class="form-group">
+                            <label>Date</label>
+                            <input type="date" class="form-control" id="mmodal-withdraw-date" required>
+                        </div>
+                        <button type="submit" class="btn-submit" style="background:var(--primary-red);">Process Withdrawal</button>
+                    </form>
+                </div>
+            </div>
+
+            <!-- TAB 4: IN-MODAL LOANS HUB -->
+            <div class="modal-tab-panel" id="md-tab-loans">
+                <div class="card-form" style="margin-bottom: 1rem;">
+                    <form onsubmit="handleModalLoanIssueSubmit(event)">
+                        <div class="form-group">
+                            <label>Disburse Loan Amount (₦)</label>
+                            <input type="number" class="form-control" id="mmodal-loan-amount" required placeholder="20000">
+                        </div>
+                        <div class="form-group">
+                            <label>Date</label>
+                            <input type="date" class="form-control" id="mmodal-loan-date" required>
+                        </div>
+                        <button type="submit" class="btn-submit">Issue Standalone Loan</button>
+                    </form>
+                </div>
+                <div style="font-weight:800; font-size:0.85rem; margin-bottom:6px;">Active Loan Records</div>
                 <div class="table-responsive">
                     <table>
                         <thead>
                             <tr>
-                                <th>DATE</th>
-                                <th>AMOUNT</th>
-                                <th>CREDITED</th>
-                                <th>NOTES</th>
+                                <th>LOAN</th>
+                                <th>PAID</th>
+                                <th>ACTION</th>
                             </tr>
                         </thead>
-                        <tbody id="md-savings-table-body"></tbody>
+                        <tbody id="md-active-loans-body"></tbody>
                     </table>
                 </div>
             </div>
 
-            <!-- PANEL 3: EDIT PROFILE & ACTIONS -->
+            <!-- TAB 5: EDIT PROFILE & RESET CONTROLS -->
             <div class="modal-tab-panel" id="md-tab-edit">
                 <div class="card-form">
                     <form onsubmit="handleMemberEditSubmit(event)">
@@ -1920,18 +1985,20 @@ INDEX_TEMPLATE = """
                             <label>New Password (Optional)</label>
                             <input type="password" class="form-control" id="edit-password" placeholder="Leave blank to keep current">
                         </div>
-                        <button type="submit" class="btn-submit">Save Member Changes</button>
+                        <button type="submit" class="btn-submit">Save Profile Changes</button>
                     </form>
-                    <div style="margin-top:12px; display:flex; gap:8px;">
-                        <button class="btn-submit" style="background:#0f172a;" onclick="resetMemberLedgerFromModal()">Reset Balance</button>
-                        <button class="btn-submit" style="background:var(--primary-red);" onclick="deleteMemberFromModal()">Delete Profile</button>
+
+                    <div style="margin-top:14px; display:flex; flex-direction:column; gap:8px;">
+                        <button class="btn-submit" style="background:#d97706;" onclick="resetMemberTargetFromModal()">Reset Daily Target (₦500 Default)</button>
+                        <button class="btn-submit" style="background:#0f172a;" onclick="resetMemberLedgerFromModal()">Reset Financial History (Including Service Fees)</button>
+                        <button class="btn-submit" style="background:var(--primary-red);" onclick="deleteMemberFromModal()">Delete Profile Permanently</button>
                     </div>
                 </div>
             </div>
         </div>
     </div>
 
-    <!-- MODAL: LOAN REPAYMENT -->
+    <!-- REPAY LOAN MODAL -->
     <div class="modal-overlay" id="loan-repay-modal" onclick="if(event.target===this) closeModal('loan-repay-modal')">
         <div class="modal-card">
             <div class="modal-header">
@@ -1963,6 +2030,7 @@ INDEX_TEMPLATE = """
     <script>
         let currentUser = null;
         let membersList = [];
+        let currentModalMemberId = null;
 
         function showToast(msg, type = 'success') {
             const container = document.getElementById('toast-container');
@@ -1980,29 +2048,17 @@ INDEX_TEMPLATE = """
         function switchModalTab(panelId, btnEl) {
             document.querySelectorAll('.modal-tab-panel').forEach(p => p.classList.remove('active'));
             document.querySelectorAll('.modal-tab').forEach(b => b.classList.remove('active'));
-            
             document.getElementById(panelId).classList.add('active');
             btnEl.classList.add('active');
         }
-
-        // Auto-close search dropdown on tap outside
-        document.addEventListener('click', function(e) {
-            const dropdown = document.getElementById('search-results-dropdown');
-            const searchInput = document.getElementById('global-search-input');
-            if (dropdown && !dropdown.contains(e.target) && e.target !== searchInput) {
-                dropdown.style.display = 'none';
-            }
-        });
 
         async function initApp() {
             const today = new Date().toISOString().split('T')[0];
             const currentMonth = new Date().toISOString().slice(0, 7);
             
-            if (document.getElementById('savings-date')) document.getElementById('savings-date').value = today;
-            if (document.getElementById('withdraw-date')) document.getElementById('withdraw-date').value = today;
-            if (document.getElementById('loan-date')) document.getElementById('loan-date').value = today;
-            if (document.getElementById('repay-date')) document.getElementById('repay-date').value = today;
-            if (document.getElementById('tracker-date-filter')) document.getElementById('tracker-date-filter').value = today;
+            ['savings-date', 'withdraw-date', 'loan-date', 'repay-date', 'tracker-date-filter', 'mmodal-savings-date', 'mmodal-withdraw-date', 'mmodal-loan-date'].forEach(id => {
+                if (document.getElementById(id)) document.getElementById(id).value = today;
+            });
             if (document.getElementById('fee-month-filter')) document.getElementById('fee-month-filter').value = currentMonth;
             
             try {
@@ -2011,8 +2067,6 @@ INDEX_TEMPLATE = """
                 if (data.logged_in) {
                     currentUser = data;
                     document.getElementById('header-member-count').innerText = data.total_members || 0;
-                    
-                    // PRE-LOAD MEMBERS LIST FOR INSTANT SEARCH
                     loadMembers();
 
                     if (data.role === 'admin') {
@@ -2052,13 +2106,9 @@ INDEX_TEMPLATE = """
         }
 
         function goBackHome() {
-            if (currentUser && currentUser.role === 'admin') {
-                showSection('home');
-            } else if (currentUser) {
-                showSection('member-portal');
-            } else {
-                showSection('login');
-            }
+            if (currentUser && currentUser.role === 'admin') showSection('home');
+            else if (currentUser) showSection('member-portal');
+            else showSection('login');
         }
 
         async function handleLoginSubmit(e) {
@@ -2086,36 +2136,99 @@ INDEX_TEMPLATE = """
             showSection('login');
         }
 
+        // ULTRA-SMART MULTI-FORMAT SEARCH MATCHING (2-Digit, Name, or SVR ID)
+        function filterMembersListByQuery(query) {
+            if (!query) return membersList;
+            const cleanQ = query.toLowerCase().trim();
+            const numVal = parseInt(cleanQ, 10);
+
+            return membersList.filter(m => {
+                const name = (m.full_name || '').toLowerCase();
+                const id = (m.member_id || '').toLowerCase();
+                const digitsOnly = id.replace(/\D/g, '');
+                const unpadded = parseInt(digitsOnly, 10).toString();
+
+                return name.includes(cleanQ) || 
+                       id.includes(cleanQ) || 
+                       digitsOnly.includes(cleanQ) ||
+                       unpadded === cleanQ ||
+                       (!isNaN(numVal) && (parseInt(digitsOnly, 10) === numVal || digitsOnly.includes(cleanQ)));
+            });
+        }
+
+        function populateMemberSelectOptions(selectId, list) {
+            const el = document.getElementById(selectId);
+            if (!el) return;
+            const currentVal = el.value;
+            el.innerHTML = '<option value="">-- Select Member --</option>' +
+                list.map(m => `<option value="${m.member_id}">${m.full_name} (${m.member_id})</option>`).join('');
+            if (currentVal) el.value = currentVal;
+        }
+
+        function filterSelectOptions(selectId, query) {
+            const filtered = filterMembersListByQuery(query);
+            populateMemberSelectOptions(selectId, filtered);
+        }
+
         async function loadMembers() {
             const res = await fetch('/api/members');
             membersList = await res.json();
 
             const selects = ['savings-member-select', 'withdraw-member-select', 'loan-member-select', 'history-member-select'];
-            selects.forEach(id => {
-                const el = document.getElementById(id);
-                if (el) {
-                    const currentVal = el.value;
-                    el.innerHTML = '<option value="">-- Select Member --</option>' +
-                        membersList.map(m => `<option value="${m.member_id}">${m.full_name} (${m.member_id})</option>`).join('');
-                    if (currentVal) el.value = currentVal;
-                }
-            });
+            selects.forEach(id => populateMemberSelectOptions(id, membersList));
 
             renderMembersDirectory(membersList);
 
+            // RENDER MANAGE MEMBERS TABLE WITH DAILY TARGET SUM & DIRECT INLINE EDITING
             const manageTable = document.getElementById('manage-members-table-body');
+            let targetSum = 0;
+
             if (manageTable) {
-                manageTable.innerHTML = membersList.map(m => `
-                    <tr>
-                        <td><strong>${m.full_name}</strong><br><small style="color:var(--text-muted);">${m.member_id}</small></td>
-                        <td>${m.username}</td>
-                        <td>₦${m.daily_target.toLocaleString()}</td>
-                        <td>
-                            <button class="btn-edit-sm" onclick="openMemberEditModal('${m.member_id}')">View Profile</button>
-                        </td>
-                    </tr>
-                `).join('');
+                manageTable.innerHTML = membersList.map(m => {
+                    targetSum += (m.daily_target || 0);
+                    return `
+                        <tr>
+                            <td>
+                                <input type="text" class="input-inline-table" id="manage-name-${m.member_id}" value="${m.full_name}">
+                                <br><small style="color:var(--text-muted); font-weight:700;">${m.member_id}</small>
+                            </td>
+                            <td><input type="text" class="input-inline-table" id="manage-uname-${m.member_id}" value="${m.username}"></td>
+                            <td><input type="number" class="input-inline-table" id="manage-target-${m.member_id}" value="${m.daily_target}"></td>
+                            <td><input type="password" class="input-inline-table" id="manage-pass-${m.member_id}" placeholder="New pass"></td>
+                            <td>
+                                <button class="btn-repay-sm" onclick="saveInlineMemberEdit('${m.member_id}')">Save</button>
+                            </td>
+                        </tr>
+                    `;
+                }).join('');
+
+                if (document.getElementById('manage-target-sum')) {
+                    document.getElementById('manage-target-sum').innerText = `₦${targetSum.toLocaleString()}`;
+                }
+                if (document.getElementById('manage-total-count')) {
+                    document.getElementById('manage-total-count').innerText = membersList.length;
+                }
             }
+        }
+
+        async function saveInlineMemberEdit(memberId) {
+            const payload = {
+                full_name: document.getElementById(`manage-name-${memberId}`).value,
+                username: document.getElementById(`manage-uname-${memberId}`).value,
+                daily_target: document.getElementById(`manage-target-${memberId}`).value,
+                password: document.getElementById(`manage-pass-${memberId}`).value
+            };
+
+            const res = await fetch(`/api/member/${memberId}`, {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload)
+            });
+            const d = await res.json();
+            if (d.success) {
+                showToast(d.message);
+                loadMembers();
+            } else showToast(d.message, 'error');
         }
 
         function renderMembersDirectory(list) {
@@ -2131,7 +2244,7 @@ INDEX_TEMPLATE = """
                             </div>
                         </div>
                         <div class="member-stats-box">
-                            <div class="stat-line"><span>Saved:</span> <span class="val-green">₦${m.total_saved.toLocaleString()}</span></div>
+                            <div class="stat-line"><span>Saved:</span> <span class="val-green">₦${m.gross_saved.toLocaleString()}</span></div>
                             <div class="stat-line"><span>Net:</span> <span>₦${m.net_balance.toLocaleString()}</span></div>
                         </div>
                         <div class="cycle-status-btn">🔄 Cycle ${m.current_cycle} (${m.cycle_days}/31d)</div>
@@ -2140,32 +2253,12 @@ INDEX_TEMPLATE = """
             }
         }
 
-        // ULTRA-SMART MULTI-FORMAT SEARCH MATCHING (1-Digit, 2-Digit, Name, or SVR ID)
-        function filterMembersListByQuery(query) {
-            if (!query) return membersList;
-            const cleanQ = query.toLowerCase().trim();
-            const numVal = parseInt(cleanQ, 10);
-
-            return membersList.filter(m => {
-                const name = (m.full_name || '').toLowerCase();
-                const id = (m.member_id || '').toLowerCase();
-                const digitsOnly = id.replace(/\D/g, ''); // Extract numeric digits e.g. "0001"
-                const parsedNum = parseInt(digitsOnly, 10); // Number integer e.g. 1
-
-                return name.includes(cleanQ) || 
-                       id.includes(cleanQ) || 
-                       digitsOnly.includes(cleanQ) || 
-                       (!isNaN(numVal) && parsedNum === numVal);
-            });
-        }
-
         function filterDirectoryCards() {
-            const query = (document.getElementById('member-search-dir') || document.getElementById('dir-filter-input')).value;
+            const query = document.getElementById('member-search-dir').value;
             const filtered = filterMembersListByQuery(query);
             renderMembersDirectory(filtered);
         }
 
-        // FAST SEARCH DROPDOWN FOR HEADER
         function handleGlobalSearchInput(e) {
             const query = e.target.value;
             const dropdown = document.getElementById('search-results-dropdown');
@@ -2190,7 +2283,7 @@ INDEX_TEMPLATE = """
         async function loadOverviewStats() {
             const res = await fetch('/api/stats/overview');
             const d = await res.json();
-            document.getElementById('stat-total-saved').innerText = `₦${d.total_savings.toLocaleString()}`;
+            document.getElementById('stat-total-saved').innerText = `₦${d.gross_total_saved.toLocaleString()}`;
             document.getElementById('stat-service-fees').innerText = `₦${d.total_fees.toLocaleString()}`;
             document.getElementById('stat-net-balance').innerText = `₦${d.net_balance.toLocaleString()}`;
         }
@@ -2314,6 +2407,186 @@ INDEX_TEMPLATE = """
                 showToast(d.message);
                 closeModal('loan-repay-modal');
                 loadLoans();
+                if (currentModalMemberId) openMemberEditModal(currentModalMemberId);
+            } else showToast(d.message, 'error');
+        }
+
+        // OPEN 360-DEGREE EXPANDED MEMBER MODAL
+        async function openMemberEditModal(memberId) {
+            currentModalMemberId = memberId;
+            const res = await fetch(`/api/member/${memberId}`);
+            const d = await res.json();
+            if (d.success) {
+                const m = d.member;
+                
+                document.getElementById('md-title').innerText = m.full_name;
+                document.getElementById('md-subid').innerText = `Member ID: ${m.member_id}`;
+                document.getElementById('md-cycle-text').innerText = `🔄 Cycle ${m.current_cycle} (${m.cycle_days} / 31 days)`;
+                
+                document.getElementById('md-gross-saved').innerText = `₦${m.gross_saved.toLocaleString()}`;
+                document.getElementById('md-total-withdrawn').innerText = `₦${m.total_withdrawn.toLocaleString()}`;
+                document.getElementById('md-net-balance').innerText = `₦${m.net_balance.toLocaleString()}`;
+                document.getElementById('md-active-loan').innerText = `₦${m.active_loan.toLocaleString()}`;
+                document.getElementById('md-service-fees').innerText = `₦${m.total_service_fees.toLocaleString()}`;
+                document.getElementById('md-daily-target').innerText = `₦${m.daily_target.toLocaleString()}`;
+
+                const tbodyRec = document.getElementById('md-recent-contributions-body');
+                if (d.recent_savings.length === 0) {
+                    tbodyRec.innerHTML = `<tr><td colspan="3" style="text-align:center; color:var(--text-muted);">No savings history found</td></tr>`;
+                } else {
+                    tbodyRec.innerHTML = d.recent_savings.map(s => `
+                        <tr>
+                            <td>${s.date}</td>
+                            <td style="color:var(--primary-green-dark); font-weight:800;">₦${s.amount.toLocaleString()}</td>
+                            <td>${s.days_credited} days</td>
+                        </tr>
+                    `).join('');
+                }
+
+                const tbodyLoans = document.getElementById('md-active-loans-body');
+                if (!d.active_loans || d.active_loans.length === 0) {
+                    tbodyLoans.innerHTML = `<tr><td colspan="3" style="text-align:center; color:var(--text-muted);">No active loans</td></tr>`;
+                } else {
+                    tbodyLoans.innerHTML = d.active_loans.map(l => `
+                        <tr>
+                            <td>₦${l.amount.toLocaleString()}</td>
+                            <td>₦${l.amount_paid.toLocaleString()}</td>
+                            <td><button class="btn-repay-sm" onclick="openLoanRepayModal(${l.id})">Repay</button></td>
+                        </tr>
+                    `).join('');
+                }
+
+                document.getElementById('edit-member-id').value = m.member_id;
+                document.getElementById('edit-fullname').value = m.full_name;
+                document.getElementById('edit-username').value = m.username;
+                document.getElementById('edit-target').value = m.daily_target;
+                document.getElementById('edit-password').value = '';
+
+                switchModalTab('md-tab-overview', document.querySelector('.modal-nav-tabs .modal-tab'));
+                document.getElementById('member-detail-modal').classList.add('active');
+            }
+        }
+
+        async function handleModalSavingsSubmit(e) {
+            e.preventDefault();
+            const payload = {
+                member_id: currentModalMemberId,
+                amount: document.getElementById('mmodal-savings-amount').value,
+                date: document.getElementById('mmodal-savings-date').value,
+                notes: document.getElementById('mmodal-savings-notes').value
+            };
+            const res = await fetch('/api/savings', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload)
+            });
+            const d = await res.json();
+            if (d.success) {
+                showToast(d.message);
+                document.getElementById('mmodal-savings-amount').value = '';
+                openMemberEditModal(currentModalMemberId);
+                loadMembers();
+            } else showToast(d.message, 'error');
+        }
+
+        async function handleModalWithdrawSubmit(e) {
+            e.preventDefault();
+            const payload = {
+                member_id: currentModalMemberId,
+                amount: document.getElementById('mmodal-withdraw-amount').value,
+                date: document.getElementById('mmodal-withdraw-date').value
+            };
+            const res = await fetch('/api/withdrawals', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload)
+            });
+            const d = await res.json();
+            if (d.success) {
+                showToast(d.message);
+                document.getElementById('mmodal-withdraw-amount').value = '';
+                openMemberEditModal(currentModalMemberId);
+                loadMembers();
+            } else showToast(d.message, 'error');
+        }
+
+        async function handleModalLoanIssueSubmit(e) {
+            e.preventDefault();
+            const payload = {
+                member_id: currentModalMemberId,
+                amount: document.getElementById('mmodal-loan-amount').value,
+                issue_date: document.getElementById('mmodal-loan-date').value
+            };
+            const res = await fetch('/api/loans', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload)
+            });
+            const d = await res.json();
+            if (d.success) {
+                showToast(d.message);
+                document.getElementById('mmodal-loan-amount').value = '';
+                openMemberEditModal(currentModalMemberId);
+                loadMembers();
+            } else showToast(d.message, 'error');
+        }
+
+        async function resetMemberTargetFromModal() {
+            if (!confirm(`Reset daily target for ${currentModalMemberId} to default (₦500)?`)) return;
+            const res = await fetch(`/api/member/${currentModalMemberId}/reset-target`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({daily_target: 500.0})
+            });
+            const d = await res.json();
+            if (d.success) {
+                showToast(d.message);
+                openMemberEditModal(currentModalMemberId);
+                loadMembers();
+            } else showToast(d.message, 'error');
+        }
+
+        async function resetMemberLedgerFromModal() {
+            if (!confirm(`Reset financial history and service fees to ZERO for ${currentModalMemberId}?`)) return;
+            const res = await fetch(`/api/member/${currentModalMemberId}/reset-ledger`, {method: 'POST'});
+            const d = await res.json();
+            if (d.success) {
+                showToast(d.message);
+                openMemberEditModal(currentModalMemberId);
+                loadMembers();
+            } else showToast(d.message, 'error');
+        }
+
+        async function deleteMemberFromModal() {
+            if (!confirm(`Permanently delete member profile ${currentModalMemberId}?`)) return;
+            const res = await fetch(`/api/member/${currentModalMemberId}`, {method: 'DELETE'});
+            const d = await res.json();
+            if (d.success) {
+                showToast(d.message);
+                closeModal('member-detail-modal');
+                loadMembers();
+            } else showToast(d.message, 'error');
+        }
+
+        async function handleMemberEditSubmit(e) {
+            e.preventDefault();
+            const mid = document.getElementById('edit-member-id').value;
+            const payload = {
+                full_name: document.getElementById('edit-fullname').value,
+                username: document.getElementById('edit-username').value,
+                daily_target: document.getElementById('edit-target').value,
+                password: document.getElementById('edit-password').value
+            };
+            const res = await fetch(`/api/member/${mid}`, {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload)
+            });
+            const d = await res.json();
+            if (d.success) {
+                showToast(d.message);
+                closeModal('member-detail-modal');
+                loadMembers();
             } else showToast(d.message, 'error');
         }
 
@@ -2393,108 +2666,6 @@ INDEX_TEMPLATE = """
             }
         }
 
-        // OPEN RICH MULTI-TAB MEMBER MODAL WITH RECENT CONTRIBUTIONS
-        async function openMemberEditModal(memberId) {
-            const res = await fetch(`/api/member/${memberId}`);
-            const d = await res.json();
-            if (d.success) {
-                const m = d.member;
-                
-                // Header & Overview Tab
-                document.getElementById('md-title').innerText = m.full_name;
-                document.getElementById('md-subid').innerText = `Member ID: ${m.member_id}`;
-                document.getElementById('md-cycle-text').innerText = `🔄 Cycle ${m.current_cycle} (${m.cycle_days} / 31 days)`;
-                
-                document.getElementById('md-total-saved').innerText = `₦${m.total_saved.toLocaleString()}`;
-                document.getElementById('md-total-withdrawn').innerText = `₦${m.total_withdrawn.toLocaleString()}`;
-                document.getElementById('md-net-balance').innerText = `₦${m.net_balance.toLocaleString()}`;
-                document.getElementById('md-active-loan').innerText = `₦${m.active_loan.toLocaleString()}`;
-                document.getElementById('md-service-fees').innerText = `₦${m.total_service_fees.toLocaleString()}`;
-                document.getElementById('md-daily-target').innerText = `₦${m.daily_target.toLocaleString()}`;
-
-                // RENDER RECENT CONTRIBUTIONS HISTORY IN MODAL OVERVIEW & SAVINGS TAB
-                const renderRecentSavings = (tbodyId) => {
-                    const tbody = document.getElementById(tbodyId);
-                    if (d.recent_savings.length === 0) {
-                        tbody.innerHTML = `<tr><td colspan="4" style="text-align:center; color:var(--text-muted);">No contribution history found</td></tr>`;
-                    } else {
-                        tbody.innerHTML = d.recent_savings.slice(0, 5).map(s => `
-                            <tr>
-                                <td>${s.date}</td>
-                                <td style="color:var(--primary-green-dark); font-weight:800;">₦${s.amount.toLocaleString()}</td>
-                                <td>${s.days_credited} days</td>
-                                <td>${s.notes || '-'}</td>
-                            </tr>
-                        `).join('');
-                    }
-                };
-
-                renderRecentSavings('md-recent-contributions-body');
-                renderRecentSavings('md-savings-table-body');
-
-                // Edit Profile Tab Form Fields
-                document.getElementById('edit-member-id').value = m.member_id;
-                document.getElementById('edit-fullname').value = m.full_name;
-                document.getElementById('edit-username').value = m.username;
-                document.getElementById('edit-target').value = m.daily_target;
-                document.getElementById('edit-password').value = '';
-
-                // Reset Modal View to First Tab ("Overview")
-                document.querySelectorAll('.modal-tab-panel').forEach(p => p.classList.remove('active'));
-                document.querySelectorAll('.modal-tab').forEach(b => b.classList.remove('active'));
-                document.getElementById('md-tab-overview').classList.add('active');
-                document.querySelector('.modal-nav-tabs .modal-tab').classList.add('active');
-
-                document.getElementById('member-detail-modal').classList.add('active');
-            }
-        }
-
-        async function handleMemberEditSubmit(e) {
-            e.preventDefault();
-            const mid = document.getElementById('edit-member-id').value;
-            const payload = {
-                full_name: document.getElementById('edit-fullname').value,
-                username: document.getElementById('edit-username').value,
-                daily_target: document.getElementById('edit-target').value,
-                password: document.getElementById('edit-password').value
-            };
-            const res = await fetch(`/api/member/${mid}`, {
-                method: 'PUT',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(payload)
-            });
-            const d = await res.json();
-            if (d.success) {
-                showToast(d.message);
-                closeModal('member-detail-modal');
-                loadMembers();
-            } else showToast(d.message, 'error');
-        }
-
-        async function resetMemberLedgerFromModal() {
-            const mid = document.getElementById('edit-member-id').value;
-            if (!confirm(`Reset financial data for member ${mid}?`)) return;
-            const res = await fetch(`/api/member/${mid}/reset-ledger`, {method: 'POST'});
-            const d = await res.json();
-            if (d.success) {
-                showToast(d.message);
-                closeModal('member-detail-modal');
-                loadMembers();
-            } else showToast(d.message, 'error');
-        }
-
-        async function deleteMemberFromModal() {
-            const mid = document.getElementById('edit-member-id').value;
-            if (!confirm(`Permanently delete member ${mid}?`)) return;
-            const res = await fetch(`/api/member/${mid}`, {method: 'DELETE'});
-            const d = await res.json();
-            if (d.success) {
-                showToast(d.message);
-                closeModal('member-detail-modal');
-                loadMembers();
-            } else showToast(d.message, 'error');
-        }
-
         async function triggerMaintenanceResync() {
             const res = await fetch('/api/maintenance/resync', {method: 'POST'});
             const d = await res.json();
@@ -2502,10 +2673,11 @@ INDEX_TEMPLATE = """
         }
 
         async function triggerMaintenanceFullReset() {
-            if (!confirm("WARNING: Wipe ALL active ledgers?")) return;
+            if (!confirm("WARNING: Reset all active financial ledgers across all members?")) return;
             const res = await fetch('/api/maintenance/reset-all-ledgers', {method: 'POST'});
             const d = await res.json();
             showToast(d.message);
+            initApp();
         }
 
         async function handlePasswordUpdateSubmit(e) {
@@ -2535,6 +2707,7 @@ INDEX_TEMPLATE = """
                 const m = d.member;
                 document.getElementById('mportal-name').innerText = m.full_name;
                 document.getElementById('mportal-id').innerText = `ID: ${m.member_id}`;
+                document.getElementById('mportal-gross-saved').innerText = `₦${m.gross_saved.toLocaleString()}`;
                 document.getElementById('mportal-balance').innerText = `₦${m.net_balance.toLocaleString()}`;
                 document.getElementById('mportal-target').innerText = `₦${m.daily_target.toLocaleString()}`;
                 document.getElementById('mportal-fees').innerText = `₦${m.total_service_fees.toLocaleString()}`;
@@ -2551,6 +2724,15 @@ INDEX_TEMPLATE = """
             }
         }
 
+        // Dismiss dropdown on tap outside
+        document.addEventListener('click', function(e) {
+            const dropdown = document.getElementById('search-results-dropdown');
+            const searchInput = document.getElementById('global-search-input');
+            if (dropdown && !dropdown.contains(e.target) && e.target !== searchInput) {
+                dropdown.style.display = 'none';
+            }
+        });
+
         window.onload = initApp;
     </script>
 </body>
@@ -2560,3 +2742,4 @@ INDEX_TEMPLATE = """
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=True)
+    
