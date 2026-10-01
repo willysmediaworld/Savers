@@ -1,6 +1,6 @@
 import os
 import sqlite3
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from flask import Flask, render_template_string, request, jsonify, g, session
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -9,6 +9,17 @@ DATABASE_URL = os.environ.get('DATABASE_URL')
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'savers_growth_31day_cycle_key_2026_secured')
+
+# -----------------------------------------------------------------------------
+# HELPER: ACCURATE MONTH-ADDITION FOR BULK SERVICE FEE SPREADING
+# -----------------------------------------------------------------------------
+def add_months(sourcedate, months):
+    month = sourcedate.month - 1 + months
+    year = sourcedate.year + month // 12
+    month = month % 12 + 1
+    max_days = [31, 29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0) else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    day = min(sourcedate.day, max_days[month - 1])
+    return date(year, month, day)
 
 # -----------------------------------------------------------------------------
 # DATABASE SETUP & SPEED INDEXING
@@ -517,7 +528,7 @@ def reset_single_member_ledger(member_id):
     return jsonify({'success': True, 'message': f'Financial data for {m["full_name"]} ({actual_id}) reset successfully!'})
 
 # -----------------------------------------------------------------------------
-# BULK SAVINGS & MULTI-MONTH SERVICE FEE SPREADING
+# BULK SAVINGS & MULTI-MONTH SERVICE FEE SPREADING (FIXED MULTI-MONTH ALGORITHM)
 # -----------------------------------------------------------------------------
 @app.route('/api/savings', methods=['GET', 'POST'])
 def handle_savings():
@@ -549,8 +560,8 @@ def handle_savings():
         cycle_days = m['cycle_days']
         daily_target = m['daily_target'] if m['daily_target'] > 0 else 500.0
 
-        base_date = datetime.strptime(savings_date_str, '%Y-%m-%d')
-        days_credited_so_far = 0
+        base_date = datetime.strptime(savings_date_str, '%Y-%m-%d').date()
+        start_cycle = current_cycle
 
         remaining_cash = deposit_amount
         total_fees_collected = 0.0
@@ -558,15 +569,16 @@ def handle_savings():
         total_days_added = 0
         fee_records = []
 
-        # ACCURATELY SPREAD SERVICE FEES ACROSS ALL CONCERNED FUTURE MONTHS
+        # ACCURATELY SPREAD SERVICE FEES ACROSS CONSECUTIVE CALENDAR MONTHS
         while remaining_cash > 0:
             if cycle_days == 0:
                 fee_deducted = min(daily_target, remaining_cash)
                 remaining_cash -= fee_deducted
                 total_fees_collected += fee_deducted
 
-                # Calculate target date for this cycle's service fee
-                target_fee_date = base_date + timedelta(days=days_credited_so_far)
+                # Calculate target date by advancing 1 month per cycle
+                month_offset = current_cycle - start_cycle
+                target_fee_date = add_months(base_date, month_offset)
                 fee_date_fmt = target_fee_date.strftime('%Y-%m-%d')
                 fee_month_fmt = target_fee_date.strftime('%Y-%m')
 
@@ -593,7 +605,6 @@ def handle_savings():
                 total_savings_credited += cash_spent
                 total_days_added += days_bought
                 cycle_days += days_bought
-                days_credited_so_far += days_bought
 
             if days_bought == 0 and remaining_cash < daily_target and cycle_days > 0:
                 break
@@ -602,7 +613,7 @@ def handle_savings():
                 current_cycle += 1
                 cycle_days = 0
 
-        # INSERT EXTRACTED SERVICE FEES DATED BY CONCERNED MONTHS
+        # INSERT EXTRACTED SERVICE FEES DATED BY CONSECUTIVE MONTHS
         for f in fee_records:
             cursor.execute(f'''
                 INSERT INTO savings (member_id, amount, date, month_year, is_service_fee, days_credited, notes)
@@ -1049,6 +1060,7 @@ INDEX_TEMPLATE = """
             background-color: var(--bg-body);
             color: var(--text-dark);
             display: flex; flex-direction: column; min-height: 100vh;
+            padding-top: 112px; /* Prevent page content from hiding under fixed sticky header */
         }
 
         /* Toast Notifications */
@@ -1063,18 +1075,20 @@ INDEX_TEMPLATE = """
         .toast.error { background: var(--primary-red); }
         @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
 
-        /* REQ 1: STICKY TOP CONTAINER (HEADER, BACK BUTTON, AND SEARCH BAR FIXED AT TOP) */
+        /* FIXED NON-SCROLLABLE STICKY TOP WRAPPER */
         .sticky-header-container {
-            position: sticky;
+            position: fixed;
             top: 0;
-            z-index: 500;
+            left: 0;
+            right: 0;
+            z-index: 1000;
             background: #ffffff;
             border-bottom: 1.5px solid var(--border-light);
-            box-shadow: 0 2px 10px rgba(0,0,0,0.03);
+            box-shadow: 0 2px 10px rgba(0,0,0,0.04);
         }
 
         header {
-            padding: 0.85rem 1rem 0.4rem 1rem;
+            padding: 0.75rem 1rem 0.25rem 1rem;
             display: flex; justify-content: space-between; align-items: center;
         }
         header .brand-box { display: flex; align-items: center; gap: 10px; cursor: pointer; }
@@ -1098,9 +1112,9 @@ INDEX_TEMPLATE = """
             cursor: pointer; min-height: 36px;
         }
 
-        /* SEARCH BAR & NON-SCROLLABLE BACK BUTTON ROW */
+        /* SEARCH BAR & FIXED STICKY BACK BUTTON ROW */
         .sticky-nav-bar {
-            padding: 0.2rem 1rem 0.75rem 1rem;
+            padding: 0.25rem 1rem 0.6rem 1rem;
             max-width: 600px;
             margin: 0 auto;
             width: 100%;
@@ -1124,15 +1138,15 @@ INDEX_TEMPLATE = """
             gap: 6px;
             white-space: nowrap;
             flex-shrink: 0;
-            box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+            box-shadow: 0 2px 6px rgba(0,0,0,0.12);
         }
         .btn-back-sticky:active { transform: scale(0.96); }
 
         .search-wrapper { position: relative; width: 100%; flex: 1; }
         .search-wrapper i { position: absolute; left: 16px; top: 50%; transform: translateY(-50%); color: #94a3b8; font-size: 0.95rem; }
         .search-input {
-            width: 100%; padding: 10px 16px 10px 42px; border-radius: 30px;
-            border: 1.5px solid var(--border-light); font-size: 0.9rem; outline: none; background: #ffffff;
+            width: 100%; padding: 9px 16px 9px 42px; border-radius: 30px;
+            border: 1.5px solid var(--border-light); font-size: 0.88rem; outline: none; background: #ffffff;
         }
         .search-results-dropdown {
             position: absolute; top: 100%; left: 0; right: 0; background: #ffffff;
@@ -1161,7 +1175,7 @@ INDEX_TEMPLATE = """
 
         .login-card {
             background: #ffffff; border: 1.5px solid var(--border-light);
-            border-radius: 20px; padding: 1.75rem 1.25rem; max-width: 420px; margin: 2rem auto;
+            border-radius: 20px; padding: 1.75rem 1.25rem; max-width: 420px; margin: 1rem auto;
             box-shadow: 0 4px 12px rgba(0,0,0,0.03);
         }
         .login-header { text-align: center; margin-bottom: 1.5rem; }
@@ -1288,7 +1302,7 @@ INDEX_TEMPLATE = """
         .modal-overlay {
             position: fixed; top: 0; left: 0; right: 0; bottom: 0;
             background: rgba(15, 23, 42, 0.6); backdrop-filter: blur(3px);
-            z-index: 1000; display: none; align-items: center; justify-content: center; padding: 0.85rem;
+            z-index: 2000; display: none; align-items: center; justify-content: center; padding: 0.85rem;
         }
         .modal-overlay.active { display: flex; }
         .modal-card {
@@ -1382,7 +1396,7 @@ INDEX_TEMPLATE = """
 
     <div id="toast-container"></div>
 
-    <!-- REQ 1: STICKY TOP WRAPPER (HEADER, BACK BUTTON, AND SEARCH BAR FIXED AT TOP) -->
+    <!-- FIXED STICKY TOP CONTAINER (HEADER, BACK BUTTON, AND SEARCH BAR FIXED AT TOP) -->
     <div class="sticky-header-container">
         <header>
             <div class="brand-box" onclick="handleHeaderClick()">
@@ -1399,9 +1413,8 @@ INDEX_TEMPLATE = """
             </div>
         </header>
 
-        <!-- SEARCH BAR & STICKY BACK BUTTON ROW -->
+        <!-- SEARCH BAR & FIXED STICKY BACK BUTTON ROW -->
         <div class="sticky-nav-bar" id="admin-search-container">
-            <!-- REQ 1: NON-SCROLLABLE STICKY BACK BUTTON -->
             <button class="btn-back-sticky" id="global-back-btn" onclick="goBackHome()">
                 <i class="fa-solid fa-arrow-left"></i> Back
             </button>
@@ -1712,7 +1725,7 @@ INDEX_TEMPLATE = """
 
             <div class="filter-row">
                 <input type="date" id="tracker-date-filter" onchange="loadTracker()">
-                <button class="btn-back" onclick="clearTrackerDateFilter()">Show All Days</button>
+                <button class="btn-add-header" style="background:#64748b;" onclick="clearTrackerDateFilter()">Show All Days</button>
             </div>
 
             <div class="overview-box" style="margin-bottom: 1.25rem;">
@@ -1760,7 +1773,7 @@ INDEX_TEMPLATE = """
 
             <div class="filter-row">
                 <input type="month" id="fees-month-filter" onchange="loadServiceFees()">
-                <button class="btn-back" onclick="clearFeesMonthFilter()">Show All Months</button>
+                <button class="btn-add-header" style="background:#64748b;" onclick="clearFeesMonthFilter()">Show All Months</button>
             </div>
 
             <div class="overview-box" style="margin-bottom: 1.25rem;">
@@ -1970,7 +1983,7 @@ INDEX_TEMPLATE = """
             <div class="modal-nav-tabs">
                 <div class="modal-tab active" onclick="switchModalTab('overview')">Overview</div>
                 <div class="modal-tab" onclick="switchModalTab('save')">➕ Save</div>
-                <div class="modal-tab" onclick="switchModalTab('withdraw')">🏧 Withdraw</div>
+                <div class="modal-tab" onclick="switchModalTab('withdraw')">Role</div>
                 <div class="modal-tab" onclick="switchModalTab('loans')">💳 Issue Loan</div>
                 <div class="modal-tab" onclick="switchModalTab('manage')">⚙️ Edit / Credentials</div>
             </div>
@@ -2117,7 +2130,7 @@ INDEX_TEMPLATE = """
             <div class="modal-title" id="confirm-modal-title" style="margin-bottom:8px;">Are you sure?</div>
             <p id="confirm-modal-msg" style="font-size:0.9rem; color:var(--text-muted); margin-bottom:1.25rem;"></p>
             <div style="display:flex; gap:10px;">
-                <button class="btn-back" style="flex:1; padding:12px;" onclick="resolveConfirmModal(false)">Cancel</button>
+                <button class="btn-add-header" style="flex:1; padding:12px; background:#e2e8f0; color:#0f172a; justify-content:center;" onclick="resolveConfirmModal(false)">Cancel</button>
                 <button class="btn-submit" id="confirm-modal-btn" style="flex:1; background:var(--primary-red);" onclick="resolveConfirmModal(true)">Confirm</button>
             </div>
         </div>
@@ -2131,7 +2144,7 @@ INDEX_TEMPLATE = """
                 <input type="number" step="0.01" class="form-control" id="prompt-modal-input" placeholder="e.g. 2000">
             </div>
             <div style="display:flex; gap:10px; margin-top:1rem;">
-                <button class="btn-back" style="flex:1; padding:12px;" onclick="resolvePromptModal(null)">Cancel</button>
+                <button class="btn-add-header" style="flex:1; padding:12px; background:#e2e8f0; color:#0f172a; justify-content:center;" onclick="resolvePromptModal(null)">Cancel</button>
                 <button class="btn-submit" style="flex:1;" onclick="submitPromptModal()">Submit</button>
             </div>
         </div>
@@ -2323,7 +2336,7 @@ INDEX_TEMPLATE = """
             }
         }
 
-        /* SHOW / HIDE STICKY BACK BUTTON DEPENDING ON ACTIVE VIEW */
+        /* TOGGLE VISIBILITY OF STICKY TOP BACK BUTTON BASED ON CURRENT SECTION */
         function showSection(sectionId) {
             document.querySelectorAll('.view-section').forEach(sec => sec.classList.remove('active'));
             const target = document.getElementById(`view-${sectionId}`);
