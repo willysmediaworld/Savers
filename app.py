@@ -184,12 +184,20 @@ def get_wallet_overview():
     total_withdrawals = cursor.fetchone()[0]
     cursor.execute('SELECT COUNT(*) FROM members')
     total_members = cursor.fetchone()[0]
+    # NEW: total loans stats
+    cursor.execute('SELECT COALESCE(SUM(amount), 0) FROM loans')
+    total_loans_issued = cursor.fetchone()[0]
+    cursor.execute("SELECT COALESCE(SUM(repayment_amount - amount_paid), 0) FROM loans WHERE status = 'active'")
+    total_loans_outstanding = cursor.fetchone()[0]
+
     gross_total_saved = net_savings_credited + total_fees
     net_balance = net_savings_credited - total_withdrawals
     return jsonify({
         'gross_total_saved': gross_total_saved, 'net_savings_credited': net_savings_credited,
         'total_fees': total_fees, 'net_balance': net_balance,
-        'total_withdrawals': total_withdrawals, 'total_members': total_members
+        'total_withdrawals': total_withdrawals, 'total_members': total_members,
+        'total_loans_issued': total_loans_issued,
+        'total_loans_outstanding': total_loans_outstanding
     })
 
 @app.route('/api/members', methods=['GET', 'POST'])
@@ -677,7 +685,7 @@ def reset_archives():
     cursor = db.cursor()
     cursor.execute('DELETE FROM transaction_archives')
     db.commit()
-    return jsonify({'success': True, 'message': 'All past transaction archives have been wiped. Active ledgers and member profiles are unaffected.'})
+    return jsonify({'success': True, 'message': 'All past transaction archives have been wiped (records AND totals). Active ledgers and member profiles are unaffected.'})
 
 @app.route('/api/maintenance/resync', methods=['POST'])
 def resync_ledger():
@@ -817,6 +825,7 @@ INDEX_TEMPLATE = """
         .overview-row .amount-saved { font-size: 1.1rem; font-weight: 800; color: var(--primary-green-dark); }
         .overview-row .amount-fees { font-size: 1.1rem; font-weight: 800; color: var(--amber-fee); }
         .overview-row .amount-net { font-size: 1.2rem; font-weight: 800; color: var(--primary-green-dark); }
+        .overview-row .amount-loan { font-size: 1.05rem; font-weight: 800; color: var(--primary-red); }
         .overview-divider { height: 1px; background: #cbd5e1; margin: 2px 0; }
         .action-stack { display: flex; flex-direction: column; gap: 0.75rem; }
         .btn-action-primary { background: var(--primary-red); color: white; border: none; padding: 14px; border-radius: 12px; font-weight: 800; font-size: 0.95rem; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 48px; touch-action: manipulation; }
@@ -1024,6 +1033,7 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
+        <!-- WALLET OVERVIEW — WITH LOANS ADDED -->
         <div id="view-overview" class="view-section">
             <div class="view-header-row"><div class="view-title-group">👛 Wallet Overview</div></div>
             <div class="overview-box">
@@ -1031,6 +1041,9 @@ INDEX_TEMPLATE = """
                 <div class="overview-row"><span>Total Service Fees Deducted:</span><span class="amount-fees" id="stat-service-fees">₦0.00</span></div>
                 <div class="overview-divider"></div>
                 <div class="overview-row"><span>Net Wallet Balance:</span><span class="amount-net" id="stat-net-balance">₦0.00</span></div>
+                <div class="overview-divider"></div>
+                <div class="overview-row"><span>Total Loans Issued:</span><span class="amount-loan" id="stat-loans-issued">₦0.00</span></div>
+                <div class="overview-row"><span>Total Loans Outstanding:</span><span class="amount-loan" id="stat-loans-outstanding">₦0.00</span></div>
             </div>
             <div class="action-stack">
                 <button class="btn-action-primary" onclick="showSection('withdrawal')"><i class="fa-solid fa-cash-register"></i> Proceed to Withdrawal</button>
@@ -1083,28 +1096,18 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
+        <!-- LOAN MANAGEMENT — FORM REMOVED, SUMMARY ADDED -->
         <div id="view-loans" class="view-section">
             <div class="view-header-row"><div class="view-title-group">💳 Standalone Loan Management</div></div>
-            <p style="font-size:0.8rem; color:var(--text-muted); margin-bottom:12px;">* Loans do not restrict or alter savings wallet balance.</p>
-            <div class="card-form" style="margin-bottom: 1.2rem;">
-                <form onsubmit="handleLoanIssueSubmit(event)">
-                    <div class="form-group">
-                        <label>Search Member (Type 2 digits e.g. 01, 12 or Name)</label>
-                        <div class="member-picker-container">
-                            <input type="text" class="form-control" id="loan-member-input" placeholder="Type digit (e.g. 01) or name..." autocomplete="off"
-                                   oninput="handlePickerSearch('loan-member-input', 'loan-member-id', 'loan-picker-dropdown', 'loan-badge', 'loan-preview')">
-                            <input type="hidden" id="loan-member-id" required>
-                            <div class="member-picker-dropdown" id="loan-picker-dropdown"></div>
-                        </div>
-                        <div class="selected-member-badge" id="loan-badge" style="display:none;"></div>
-                        <div class="member-preview-card" id="loan-preview" style="display:none;"></div>
-                    </div>
-                    <div class="form-group"><label>Loan Amount (₦)</label><input type="number" class="form-control" id="loan-amount" placeholder="e.g. 50000" required></div>
-                    <div class="form-group"><label>Disbursement Date</label><input type="date" class="form-control" id="loan-date" required></div>
-                    <button type="submit" class="btn-submit">Disburse Loan</button>
-                </form>
+            <p style="font-size:0.8rem; color:var(--text-muted); margin-bottom:12px;">* Issue new loans from a member's profile (search or click a member card). Loans do not restrict or alter savings wallet balance.</p>
+
+            <div class="overview-box" style="margin-bottom: 1rem; background: #fef3c7; border-color: #fde68a;">
+                <div class="overview-row"><span>Total Loans Issued:</span><span id="loan-total-issued" style="font-weight:800; color:var(--primary-red); font-size:1.05rem;">₦0.00</span></div>
+                <div class="overview-row"><span>Total Loans Outstanding:</span><span id="loan-total-outstanding" style="font-weight:800; color:var(--primary-red); font-size:1.05rem;">₦0.00</span></div>
+                <div class="overview-row"><span>Total Loans Cleared:</span><span id="loan-total-cleared" style="font-weight:800; color:var(--primary-green-dark); font-size:1.05rem;">₦0.00</span></div>
             </div>
-            <div style="font-weight:800; font-size:0.95rem; margin-bottom:8px;">Active & Cleared Loans</div>
+
+            <div style="font-weight:800; font-size:0.95rem; margin-bottom:8px;">All Loan Records</div>
             <div class="table-responsive">
                 <table>
                     <thead><tr><th>MEMBER</th><th>LOAN</th><th>PAID</th><th>STATUS</th><th>ACTION</th></tr></thead>
@@ -1236,7 +1239,6 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- PAST RECORDS (WITH BULK SUMMARY + RESET) -->
         <div id="view-past-records" class="view-section">
             <div class="view-header-row"><div class="view-title-group">📦 Past Transaction Archives</div></div>
 
@@ -1254,7 +1256,7 @@ INDEX_TEMPLATE = """
 
             <div class="card-form" style="border-color: #fca5a5;">
                 <div style="font-weight:800; color:var(--primary-red); margin-bottom:6px;"><i class="fa-solid fa-eraser"></i> Reset Past Records</div>
-                <p style="font-size:0.8rem; color:var(--text-muted); margin-bottom:10px;">Wipes <strong>ALL</strong> archived transactions. Active ledgers (savings, withdrawals, loans, fees) and member profiles are <strong>not</strong> affected. This cannot be undone.</p>
+                <p style="font-size:0.8rem; color:var(--text-muted); margin-bottom:10px;">Wipes <strong>ALL</strong> archived transactions (records AND totals). Active ledgers (savings, withdrawals, loans, fees) and member profiles are <strong>not</strong> affected. This cannot be undone.</p>
                 <button class="btn-submit" style="background:var(--primary-red);" onclick="resetPastRecords()">Reset All Past Records</button>
             </div>
         </div>
@@ -1737,6 +1739,8 @@ INDEX_TEMPLATE = """
             document.getElementById('stat-total-saved').innerText = `₦${d.gross_total_saved.toLocaleString()}`;
             document.getElementById('stat-service-fees').innerText = `₦${d.total_fees.toLocaleString()}`;
             document.getElementById('stat-net-balance').innerText = `₦${d.net_balance.toLocaleString()}`;
+            document.getElementById('stat-loans-issued').innerText = `₦${(d.total_loans_issued || 0).toLocaleString()}`;
+            document.getElementById('stat-loans-outstanding').innerText = `₦${(d.total_loans_outstanding || 0).toLocaleString()}`;
         }
 
         function showSavingsBreakdown(b) {
@@ -1812,39 +1816,41 @@ INDEX_TEMPLATE = """
             } else showMessage(d.message, 'error');
         }
 
+        // ---------------- LOANS (FORM REMOVED, TOTALS ADDED) ----------------
         async function loadLoans() {
             const res = await fetch('/api/loans');
             const loans = await res.json();
-            const tbody = document.getElementById('loans-table-body');
-            tbody.innerHTML = loans.map(l => `
-                <tr>
-                    <td><strong>${l.full_name}</strong></td>
-                    <td>₦${l.amount.toLocaleString()}</td>
-                    <td>₦${l.amount_paid.toLocaleString()}</td>
-                    <td><span class="badge ${l.status === 'cleared' ? 'badge-success' : 'badge-fee'}">${l.status}</span></td>
-                    <td>${l.status === 'active' ? `<button class="btn-repay-sm" onclick="openLoanRepayModal(${l.id})">Repay</button>` : 'Cleared'}</td>
-                </tr>
-            `).join('');
-        }
 
-        async function handleLoanIssueSubmit(e) {
-            e.preventDefault();
-            const memberId = document.getElementById('loan-member-id').value;
-            if (!memberId) { showMessage('Please search and select a member.', 'error'); return; }
-            const payload = {
-                member_id: memberId, amount: document.getElementById('loan-amount').value,
-                issue_date: document.getElementById('loan-date').value
-            };
-            const res = await fetch('/api/loans', {
-                method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
+            // Compute totals
+            let totalIssued = 0;
+            let totalOutstanding = 0;
+            let totalCleared = 0;
+            loans.forEach(l => {
+                const amt = l.amount || 0;
+                const paid = l.amount_paid || 0;
+                const remain = Math.max(0, (l.repayment_amount || amt) - paid);
+                totalIssued += amt;
+                if (l.status === 'active') totalOutstanding += remain;
+                else totalCleared += paid;
             });
-            const d = await res.json();
-            if (d.success) {
-                document.getElementById('loan-amount').value = '';
-                clearPickerSelection('loan-member-input', 'loan-member-id', 'loan-badge', 'loan-preview');
-                loadLoans();
-                showMessage(d.message, 'success', 'Loan Issued');
-            } else showMessage(d.message, 'error');
+            document.getElementById('loan-total-issued').innerText = `₦${totalIssued.toLocaleString()}`;
+            document.getElementById('loan-total-outstanding').innerText = `₦${totalOutstanding.toLocaleString()}`;
+            document.getElementById('loan-total-cleared').innerText = `₦${totalCleared.toLocaleString()}`;
+
+            const tbody = document.getElementById('loans-table-body');
+            if (loans.length === 0) {
+                tbody.innerHTML = `<tr><td colspan="5" style="text-align:center; color:var(--text-muted); padding:16px;">No loan records</td></tr>`;
+            } else {
+                tbody.innerHTML = loans.map(l => `
+                    <tr>
+                        <td><strong>${l.full_name}</strong> <small style="color:var(--text-muted);">(${l.member_id})</small></td>
+                        <td>₦${l.amount.toLocaleString()}</td>
+                        <td>₦${l.amount_paid.toLocaleString()}</td>
+                        <td><span class="badge ${l.status === 'cleared' ? 'badge-success' : 'badge-fee'}">${l.status}</span></td>
+                        <td>${l.status === 'active' ? `<button class="btn-repay-sm" onclick="openLoanRepayModal(${l.id})">Repay</button>` : 'Cleared'}</td>
+                    </tr>
+                `).join('');
+            }
         }
 
         function openLoanRepayModal(loanId) {
@@ -2093,7 +2099,6 @@ INDEX_TEMPLATE = """
             `).join('');
         }
 
-        // ---------------- PAST RECORDS (BULK SUMMARY + RESET) ----------------
         async function loadPastRecords() {
             const res = await fetch('/api/archives');
             const records = await res.json();
@@ -2124,7 +2129,7 @@ INDEX_TEMPLATE = """
         }
 
         function resetPastRecords() {
-            showConfirm('<strong style="color:#7f1d1d;">Reset ALL Past Records</strong><br><br>This will permanently wipe every archived transaction.<br><br>• Active ledgers (savings, withdrawals, loans, service fees) are <strong>NOT</strong> touched.<br>• Member profiles are <strong>NOT</strong> touched.<br>• Only the archive history is erased.<br><br>This action <strong>cannot be undone</strong>. Continue?', async () => {
+            showConfirm('<strong style="color:#7f1d1d;">Reset ALL Past Records</strong><br><br>This will permanently wipe every archived transaction <strong>and reset the total archive amount to zero</strong>.<br><br>• Active ledgers (savings, withdrawals, loans, service fees) are <strong>NOT</strong> touched.<br>• Member profiles are <strong>NOT</strong> touched.<br>• Only the archive history and totals are erased.<br><br>This action <strong>cannot be undone</strong>. Continue?', async () => {
                 const res = await fetch('/api/archives/reset', {method: 'POST'});
                 const d = await res.json();
                 if (d.success) {
