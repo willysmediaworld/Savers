@@ -640,6 +640,10 @@ def handle_savings():
                 remaining_cash -= fee_deducted
                 total_fees_collected += fee_deducted
 
+                # ✅ Service fee occupies Day 1 of the cycle.
+                # Cycle = 1 fee day + 30 savings days = 31 total.
+                cycle_days += 1
+
                 month_offset = current_cycle - start_cycle
                 target_fee_date = add_months(base_date, month_offset)
                 fee_month_fmt = target_fee_date.strftime('%Y-%m')
@@ -704,8 +708,10 @@ def handle_savings():
 
         msg = f"Processed ₦{deposit_amount:,.2f} for {full_name}! "
         if total_fees_collected > 0:
-            msg += f"₦{total_fees_collected:,.2f} fee extracted. "
-        msg += f"₦{total_savings_credited:,.2f} saved ({total_days_added} days credited)."
+            msg += f"₦{total_fees_collected:,.2f} fee (Day 1). "
+        if total_savings_credited > 0:
+            msg += f"₦{total_savings_credited:,.2f} saved ({total_days_added} savings days). "
+        msg += f"Now on Cycle {current_cycle} — Day {cycle_days}/31."
 
         return jsonify({'success': True, 'message': msg})
 
@@ -2104,7 +2110,7 @@ INDEX_TEMPLATE = """
 
     <footer>
         Savers Growth System &copy; 2026<br>
-        <span style="font-size:0.75rem; color:var(--text-muted);">Cycle Baseline: Anchored to 1st of Every Month</span>
+        <span style="font-size:0.75rem; color:var(--text-muted);">Cycle: 1 Fee Day + 30 Savings Days = 31 Total</span>
     </footer>
 
     <script>
@@ -2890,3 +2896,4 @@ INDEX_TEMPLATE = """
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=True)
+    
