@@ -184,7 +184,6 @@ def get_wallet_overview():
     total_withdrawals = cursor.fetchone()[0]
     cursor.execute('SELECT COUNT(*) FROM members')
     total_members = cursor.fetchone()[0]
-    # NEW: total loans stats
     cursor.execute('SELECT COALESCE(SUM(amount), 0) FROM loans')
     total_loans_issued = cursor.fetchone()[0]
     cursor.execute("SELECT COALESCE(SUM(repayment_amount - amount_paid), 0) FROM loans WHERE status = 'active'")
@@ -1033,7 +1032,6 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- WALLET OVERVIEW — WITH LOANS ADDED -->
         <div id="view-overview" class="view-section">
             <div class="view-header-row"><div class="view-title-group">👛 Wallet Overview</div></div>
             <div class="overview-box">
@@ -1096,7 +1094,6 @@ INDEX_TEMPLATE = """
             </div>
         </div>
 
-        <!-- LOAN MANAGEMENT — FORM REMOVED, SUMMARY ADDED -->
         <div id="view-loans" class="view-section">
             <div class="view-header-row"><div class="view-title-group">💳 Standalone Loan Management</div></div>
             <p style="font-size:0.8rem; color:var(--text-muted); margin-bottom:12px;">* Issue new loans from a member's profile (search or click a member card). Loans do not restrict or alter savings wallet balance.</p>
@@ -1447,7 +1444,15 @@ INDEX_TEMPLATE = """
         let currentModalMemberId = null;
         let msgModalCallback = null;
 
+        // Dismiss any on-screen keyboard before opening the message modal
+        function dismissKeyboard() {
+            if (document.activeElement && typeof document.activeElement.blur === 'function') {
+                document.activeElement.blur();
+            }
+        }
+
         function showMessage(msg, type = 'info', title = null) {
+            dismissKeyboard();
             msgModalCallback = null;
             const iconWrap = document.getElementById('msg-icon');
             iconWrap.className = 'msg-icon-wrap ' + (type === 'error' ? 'error' : type === 'success' ? 'success' : 'info');
@@ -1464,6 +1469,7 @@ INDEX_TEMPLATE = """
         }
 
         function showConfirm(msg, onConfirm, title = 'Please Confirm') {
+            dismissKeyboard();
             msgModalCallback = onConfirm;
             const iconWrap = document.getElementById('msg-icon');
             iconWrap.className = 'msg-icon-wrap info';
@@ -1629,7 +1635,7 @@ INDEX_TEMPLATE = """
             document.getElementById(inputId).style.display = 'block';
             document.getElementById(badgeId).style.display = 'none';
             if (previewId) { const p = document.getElementById(previewId); if (p) p.style.display = 'none'; }
-            document.getElementById(inputId).focus();
+            // No auto-focus — prevents the mobile keyboard from popping up unexpectedly
         }
 
         async function loadMembers() {
@@ -1816,12 +1822,10 @@ INDEX_TEMPLATE = """
             } else showMessage(d.message, 'error');
         }
 
-        // ---------------- LOANS (FORM REMOVED, TOTALS ADDED) ----------------
         async function loadLoans() {
             const res = await fetch('/api/loans');
             const loans = await res.json();
 
-            // Compute totals
             let totalIssued = 0;
             let totalOutstanding = 0;
             let totalCleared = 0;
